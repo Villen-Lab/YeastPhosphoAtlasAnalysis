@@ -1,0 +1,373 @@
+---
+title: "Description of Phosphosite Data"
+author: "Anthony Barente"
+date: "11/16/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(cowplot)
+```
+
+## 1. Intro:
+
+Here I provide an introduction to Mario Letutert's large yeast phospho perturbation dataset.
+These data were analyzed in DIA mode, searched with spectronaut, and quantified at the site level.
+Given the scale of the data, 
+100s of samples split across several replicates,
+much care in the QC process.
+In this notebook I will focus on describing basic aspects of the dataset,
+such as detections and the presence of batch effects.
+
+## 2. Data Used:
+
+Data for this report are available in:
+
+ - `yeast_phospho_data_processed/site_data_v2/data_psites.csv`
+ - `yeast_phospho_data_processed/site_data_v2/data_psites.vfilt.50.csv`
+ - `yeast_phospho_data_processed/site_data_v2/meta_runs_samples.csv`
+ 
+```{r, echo=FALSE}
+data <- read.csv("../yeast_phospho_data_processed/site_data_v2/data_psites.csv",
+                 stringsAsFactors = FALSE)
+
+filtered_data <- 
+  read.csv("../yeast_phospho_data_processed/site_data_v2/data_psites.vfilt.50.csv",
+           stringsAsFactors = FALSE)
+
+meta <- read.csv("../yeast_phospho_data_processed/site_data_v2/meta_runs_samples.csv",
+                 stringsAsFactors = FALSE)
+```
+
+## 3. Treatments and Metadata:
+
+The data include samples for 101 treatments split accross 7 measurement batches.
+Each batch contains a large portion of the total treatments,
+and all contain at least 1 untreated replicate.
+In this section we will look at the distribution of runs and treatments.
+
+```{r, echo=FALSE}
+final_run_meta <- data %>%
+                    select(run, sample) %>%
+                    mutate(treatment = sub("\\..*", "", sample, perl=TRUE)) %>%
+                    distinct() %>%
+                      inner_join(meta %>%
+                                   select(run, batch, block) %>%
+                                   filter(batch > 0) %>%
+                                   mutate(block = substr(block,2,2)),
+                                 by = "run") %>%
+                      filter(batch %in% c(2, 3, 5, 6, 7, 8, 9)) %>%
+                      mutate(batch = as.integer(factor(batch)))
+```
+
+#### 3.1 Number of runs in individual batches
+```{r, echo=FALSE}
+run_counts <- rbind(final_run_meta %>%
+                      mutate(block = "Total") %>%
+                      group_by(batch, block) %>%
+                      count(),
+                    final_run_meta %>%
+                      group_by(batch, block) %>%
+                      count()) %>%
+                mutate(block = factor(block, levels=c("Total", "A", "B", "C")))
+
+plt <- ggplot(run_counts, aes(x=as.factor(batch), y=n, fill=block)) +
+         geom_bar(stat = "identity", position = "dodge") +
+         xlab("Measurement Batch") +
+         ylab("Number of files") +
+         scale_fill_viridis_d("Block") +
+         theme_bw() +
+         theme(axis.text = element_text(size=14),
+               axis.title = element_text(size=16),
+               legend.text = element_text(size=14),
+               legend.title = element_text(size=14))
+
+filename <- "figures/1/number_of_runs_per_batch.svg"
+ggsave(filename, plot = plt, width = 10, height = 5)
+show(plt)
+```
+
+Each batch contains about 75-80 samples and is broken into 3 measurment blocks,
+which I plan to count as more finely grained batches.
+
+#### 3.2 Treatment presence in batch
+
+```{r, echo=FALSE}
+treatment_counts_batch <- final_run_meta %>%
+                            group_by(treatment, batch) %>%
+                            count() %>%
+                            pivot_wider(id_cols = "treatment", 
+                                        names_from = "batch", 
+                                        values_from="n", 
+                                        values_fill = 0) %>%
+                            pivot_longer(2:dim(.)[2], 
+                                         names_to = "batch",
+                                         values_to ="n") %>%
+                            mutate(count = if_else(n>1, ">1", as.character(n)),
+                                   count = factor(count, levels=c("0", "1", ">1")))
+
+pos_df <- treatment_counts_batch %>%
+            select(treatment) %>%
+            distinct() %>%
+            ungroup() %>%
+            mutate(ind = 1:n(),
+                   facet = floor(4*pmin(ind, 100)/n()))
+
+create.plot <- function(df, legend=FALSE) {
+  df %>%
+    ggplot(aes(y=treatment, x=as.factor(batch), fill=count)) +
+      geom_tile(alpha=.5, color="black") +
+           scale_fill_manual("Count",
+                             values = c("black", "blue", "purple"),) +
+           xlab("Treatment") +
+           ylab("Batch") +
+           theme_classic() +
+           theme(axis.text.x = element_text(size=18),
+                 axis.text.y = element_text(size=20),
+                 axis.title = element_blank(),
+                 legend.text = element_text(size=20),
+                 legend.title = element_text(size=20),
+                 legend.position = ifelse(legend, "right", "none"))
+}
+
+plt1 <- treatment_counts_batch %>%
+          left_join(pos_df, by="treatment") %>%
+          filter(facet == 0) %>%
+          create.plot()
+
+plt2 <- treatment_counts_batch %>%
+          left_join(pos_df, by="treatment") %>%
+          filter(facet == 1) %>%
+          create.plot()
+
+plt3 <- treatment_counts_batch %>%
+          left_join(pos_df, by="treatment") %>%
+          filter(facet == 2) %>%
+          create.plot()
+
+plt4 <- treatment_counts_batch %>%
+          left_join(pos_df, by="treatment") %>%
+          filter(facet == 3) %>%
+          create.plot(legend = TRUE)
+
+plt <- plot_grid(plt1, plt2, plt3, plt4, ncol=4, rel_widths = c(1, 1, 1, 1.3))
+
+filename <- "figures/1/treatment_presence_in_batch.pdf"
+ggsave(filename, plot = plt, width = 10, height = 10)
+filename <- "figures/1/treatment_presence_in_batch.svg"
+ggsave(filename, plot = plt, width = 10, height = 10)
+knitr::include_graphics(filename)
+```
+
+While no treatment is present in every single batch, most treatments are present in almost all batches.
+Some treatments with additional missingness contained outlying samples
+which were screaned elsewhere and left out of subsequent analyses.
+Given the unbalanced design, care will need to be taken so that we do not introduce unnecessary bias.
+
+## 4. Detections
+
+#### 4.1 Number of detections per run
+```{r, echo=FALSE}
+detection_counts <- data %>%
+                      group_by(run) %>%
+                      count() %>%
+                      inner_join(final_run_meta %>%
+                                   select(run, batch, block) %>%
+                                   filter(batch > 0) %>%
+                                   mutate(block = substr(block,2,2)),
+                                 by = "run") %>%
+                      arrange(batch, run) %>%
+                      ungroup() %>%
+                      mutate(idRun = 1:n())
+
+shared_breaks <- c()
+
+plt1 <- ggplot() +
+          geom_boxplot(aes(x=as.factor(batch), y=n, fill=as.factor(batch)), 
+                       data=detection_counts,
+                       alpha=.8) +
+          xlab("Batch") +
+          ylab("Detected Phosphosites") +
+          scale_fill_viridis_d("Batch") +
+          scale_y_continuous(breaks=15000*(0:6)/6,
+                             limits=c(0, 13000),
+                             expand = c(0, 0)) +
+          theme_classic() +
+          theme(axis.text.x = element_text(size=18),
+                axis.text.y = element_text(size=18),
+                axis.title = element_text(size=20),
+                legend.position = "none")
+
+plt2 <- ggplot() +
+          geom_col(aes(x=1:dim(detection_counts)[1], y=n, fill=as.factor(batch)), 
+                   data=detection_counts %>% arrange(run),
+                   width = 1) +
+          scale_fill_viridis_d("Batch") +
+          scale_x_continuous(breaks = 100*(0:5),
+                             limits = c(0., dim(detection_counts)[1] + 1),
+                             expand = c(0, 0)) +
+          scale_y_continuous(breaks=15000*(0:6)/6,
+                             limits=c(0, 13000),
+                             expand = c(0, 0)) +
+          xlab("Mass Spectrometry Run") +
+          theme_classic() + 
+          theme(axis.text = element_text(size=18),
+                axis.text.y = element_blank(),
+                axis.title = element_text(size=20),
+                axis.title.y = element_blank(),
+                legend.text = element_text(size=18),
+                legend.title = element_text(size=18))
+
+plt <- plot_grid(plt1, plt2, ncol=2, rel_widths = c(2.5, 4.5))
+filename <- "figures/1/number_of_detections_per_run.pdf"
+ggsave(filename, plot = plt, width = 7, height = 3.5)
+show(plt)    
+```
+
+Later batches are of much higher quality identification-wise than earlier batches.
+This will be an interesting thing to watch out for,
+since earlier batches will have much more imputation.
+It is unclear at this point whether this will have an impact on analyses.
+
+#### 4.2 Sites detected by missingness
+```{r, echo=FALSE}
+total_runs <- dim(data %>% select(run) %>% distinct())[1]
+site_presence <- data %>% 
+                   group_by(var) %>%
+                   count() %>%
+                   ungroup() %>%
+                   mutate(propOfRuns = n/total_runs)
+site_dropoff <- site_presence %>%
+                  arrange(-propOfRuns) %>%
+                  mutate(totalSites = 1:dim(.)[1]) %>%
+                  group_by(propOfRuns) %>%
+                  summarise(totalSites = max(totalSites))
+
+plt <- site_dropoff %>%
+         slice(seq(1, dim(site_dropoff)[1], 20)) %>%
+         ggplot(aes(x=100*propOfRuns, y=totalSites)) +
+           geom_line(alpha=.75) +
+           geom_point(alpha=.75) +
+           xlab("Detection cutoff (% of samples)") +
+           ylab("Sites\nremaining") +
+           xlim(0, 105) + 
+           scale_y_continuous(breaks=10000*(0:4), limits=c(0, 40000)) +
+           theme_bw() +
+           theme(axis.text = element_text(size=18),
+                 axis.title = element_text(size=20),
+                 legend.text = element_text(size=18),
+                 legend.title = element_text(size=18))
+
+filename <- "figures/1/sites_remaining_by_cutoff.pdf"
+ggsave(filename, plot = plt, width = 6, height = 2)
+show(plt)
+```
+
+Sites rapidly drop off with increasing stringency on missingness.
+Our final agreed upon cutoff will be 50% missingness for most analyses.
+For some analyses, such as that for kinase enrichment analysis, we will be able to ignore missing data.
+
+#### 4.2 Missingness by median intensity
+
+```{r, echo=FALSE}
+# This code section was for logistic regresion
+# but it did not turn out to be useful.
+intensity_by_detections <- data %>%
+                             group_by(var) %>%
+                             summarise(medianIntensity=median(value)) %>%
+                             left_join(site_presence,
+                                       by="var")
+
+selected_data <- intensity_by_detections
+niter <- 5
+for (iter in 1:niter) {
+  print(iter)
+  mod <- nls(formula=propOfRuns~SSlogis(medianIntensity, Asym, xmid, scal),
+             data=selected_data)
+  if (iter != niter) {
+    error <- selected_data$propOfRuns - predict(mod)
+    select <- abs(error) < 2.56*sd(error)
+    selected_data <- selected_data[select,]
+  }
+}
+
+predictions <- data.frame(medianIntensity = selected_data$medianIntensity,
+                          predPropOfRuns = predict(mod)) %>%
+               arrange(medianIntensity) %>%
+               slice(seq(1, dim(.)[1], 100))
+```
+
+```{r, echo=FALSE}
+plt <- ggplot() +
+         geom_hex(aes(x=medianIntensity, y=propOfRuns),
+                  data=intensity_by_detections,
+                  bins=100) +
+         scale_fill_gradient("Count", trans = "log10") +
+         xlab("Median log intensity") +
+         ylab("Proportion of samples") +
+         theme_bw() +
+         theme(axis.text = element_text(size=20),
+               axis.title = element_text(size=20),
+               legend.text = element_text(size=20),
+               legend.title = element_text(size=20))
+
+filename <- "figures/1/rate_of_detection_by_intensity.pdf"
+ggsave(filename, plot = plt, width = 5, height = 4)
+show(plt)
+```
+
+As with most mass spectrometry data, the missingness seems to follow a left censored distribution.
+After talking to some of our colleagues, we decided QRILC imputation would work well for this dataset.
+This will give us left censored imputation with some randomness.
+
+#### 4.3 Overview of the final dataset
+
+```{r, echo=FALSE}
+site_count <- data.frame(dataset=factor(c("Original", "Filtered"), levels=c("Original", "Filtered")),
+                         count=c(nrow(data %>% distinct(var)),
+                                 nrow(filtered_data %>% distinct(var))))
+print(site_count)
+
+plt <- site_count %>%
+         ggplot(aes(x=dataset, y=count)) +
+           geom_bar(stat="identity") +
+           ggtitle("Phosphosites") +
+           xlab("") +
+           ylab("Count") +
+           theme_bw() +
+           theme(axis.text = element_text(size=22),
+                 axis.title = element_text(size=22),
+                 plot.title = element_text(size=24, hjust=.5))
+
+filename <- "figures/1/phosphosites_remaining.pdf"
+ggsave(filename, plot = plt, width = 4, height = 5)
+show(plt)
+```
+
+```{r, echo=FALSE}
+prot_count <- data.frame(dataset=factor(c("Original", "Filtered"), levels=c("Original", "Filtered")),
+                         count=c(nrow(data %>% 
+                                        mutate(var=str_replace(var, "_.*", "")) %>% 
+                                        distinct(var)),
+                                 nrow(filtered_data %>% 
+                                        mutate(var=str_replace(var, "_.*", "")) %>% 
+                                        distinct(var))))
+print(prot_count)
+
+plt <- prot_count %>%
+         ggplot(aes(x=dataset, y=count)) +
+           geom_bar(stat="identity") +
+           ggtitle("Phosphoproteins") +
+           xlab("") +
+           ylab("Count") +
+           theme_bw() +
+           theme(axis.text = element_text(size=22),
+                 axis.title = element_text(size=22),
+                 plot.title = element_text(size=24, hjust=.5))
+
+filename <- "figures/1/phosphoproteins_remaining.pdf"
+ggsave(filename, plot = plt, width = 4, height = 5)
+show(plt)
+```
