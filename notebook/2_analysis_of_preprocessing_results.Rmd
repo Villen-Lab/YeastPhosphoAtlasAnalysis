@@ -1,0 +1,561 @@
+---
+title: "Analysis of Preprocessing Results"
+author: "Anthony Barente"
+date: "11/18/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(cowplot)
+library(pvca)
+library(Biobase)
+```
+
+## 1. Intro:
+
+The two major effects that we need to address in this data are the missingness and batch effects.
+We turned to the QRILC algorithm for imputation, given the left censoring apparent in the last notebook.
+For batch correction, we used Combat, and produced a final imputated and batch corrected dataset.
+However, for differential expression, it is important that the uncorrected data is used.
+Thus, both datasets are provided as detailed bellow.
+
+## 2. Data Used:
+
+Meta data for this report are available in:
+
+ - `yeast_phospho_data_processed/site_data_v2/meta_runs_samples.csv`
+ 
+Orginal data without imputation can be found in:
+
+ - `yeast_phospho_data_processed/site_data_v2/data_psites.vfilt.50.csv`
+
+Uncorrected imputed data can be found in:
+
+ - `yeast_phospho_data_processed/site_data_v2/imputation/data_psites.vfilt.50.qrilc.rep1.csv`
+ 
+Corrected and imputed data can be found in:
+
+ - `yeast_phospho_data_processed/site_data_v2/batch_correction/data_psites.vfilt.50.qrilc.rep1.corrected.csv`
+ 
+```{r, echo=FALSE}
+base_path <- "../yeast_phospho_data_processed/site_data_v2/"
+
+original_data <- 
+  read.csv(file.path(base_path, "data_psites.vfilt.50.csv"),
+           stringsAsFactors = FALSE)
+
+imputed_data <-
+  read.csv(file.path(base_path, "imputation/data_psites.vfilt.50.qrilc.rep1.csv"),
+           stringsAsFactors = FALSE)
+
+corrected_data <-
+  read.csv(file.path(base_path, "batch_correction/data_psites.vfilt.50.qrilc.rep1.corrected.csv"),
+           stringsAsFactors = FALSE)
+
+meta <- 
+  read.csv(file.path(base_path, "meta_runs_samples.csv"),
+           stringsAsFactors = FALSE) %>%
+  filter(batch %in% c(2, 3, 5, 6, 7, 8, 9)) %>%
+  mutate(batch = as.integer(factor(batch)))
+```
+
+## 3. Effect of imputation on data
+
+The QRILC algorithm is specifically designed to impute data with low intensity values.
+It does this by assuming that all data which is missing came from the lower tail of a truncated normal.
+This is a hard assumption since often the data can be missing and still have quite high quant.
+
+#### 3.1 Total amount of imputed data
+```{r, echo=FALSE}
+noriginal <- dim(original_data)[1]
+ntotal <- dim(imputed_data)[1]
+prop_df <- data.frame(cat = factor(c("Real", "Imputed"), levels=c("Real", "Imputed")),
+                      value = c(noriginal/ntotal, (ntotal - noriginal)/noriginal))
+
+plt <- ggplot(prop_df, aes(x=cat, y=value)) +
+         geom_bar(stat="identity")  +
+         xlab("") +
+         ylab("Proportion of total") +
+         ylim(0, 1) +
+         theme_bw() +
+         theme(axis.text = element_text(size=14),
+               axis.title = element_text(size=16))
+
+filename <- "figures/2/amount_of_data_that_is_imputed.svg"
+ggsave(filename, plot = plt, width = 5, height = 5)
+show(plt)
+```
+
+Previously we decided on a cutoff of 50% missingness for the data.
+This results in a little over 30% missinness on the full data set. 
+
+```{r, echo=FALSE}
+combined_data <- rbind(original_data %>%
+                         inner_join(meta %>%
+                                      select(run, batch) %>%
+                                      filter(batch > 0),
+                                    by="run") %>%
+                         mutate(dataset="Original"),
+                       imputed_data %>%
+                         inner_join(meta %>%
+                                      select(run, batch) %>%
+                                      filter(batch > 0),
+                                    by="run") %>%
+                         mutate(dataset="Imputed"))
+
+imputation_count <- combined_data %>% 
+                      group_by(dataset, batch) %>%
+                      count() %>%
+                      group_by(batch) %>%
+                      summarise(real = last(n)/first(n),
+                                imputed = (first(n) - last(n))/first(n)) %>%
+                      pivot_longer(2:3, names_to="type", values_to="proportion")
+
+plt <- imputation_count %>%
+         filter(type=="imputed") %>%
+         ggplot(aes(x=factor(batch),
+                    y=100*proportion)) +
+           geom_bar(stat="identity", fill="#461554", alpha=.75) +
+           scale_y_continuous(limits=c(0., 40), expand=c(0, 0)) +
+           xlab("Batch") +
+           ylab("Percent imputed") + 
+           theme_classic() +
+           theme(axis.text = element_text(size=20),
+                 axis.title = element_text(size=20))
+
+filename <- "figures/2/amount_of_data_that_is_imputed_by_batch_diss.pdf"
+ggsave(filename, plot = plt, width = 2.5, height = 4)
+# filename <- "figures/2/amount_of_data_that_is_imputed_by_batch.pdf"
+# ggsave(filename, plot = plt, width = 6, height = 2)
+show(plt)
+```
+
+As expected though, this missingness is not evenly distributed accross batches.
+In some batches, where we have the deepest coverage, we see low missingness.
+It is unclear what kind of effect this will have on the final data.
+
+#### 3.2 Distribution of imputed data
+
+```{r, echo=FALSE}
+combined_data <- rbind(original_data %>%
+                         inner_join(meta %>%
+                                      select(run, batch) %>%
+                                      filter(batch > 0),
+                                    by="run") %>%
+                         mutate(dataset="Original"),
+                       imputed_data %>%
+                         inner_join(meta %>%
+                                      select(run, batch) %>%
+                                      filter(batch > 0),
+                                    by="run") %>%
+                         mutate(dataset="Imputed"))
+
+plt <- combined_data %>%
+         group_by(dataset, batch, var) %>%
+         summarise(value = median(value),
+                   .groups = "drop") %>%
+         ggplot(aes(x=factor(batch), 
+                    y=value, 
+                    fill=factor(dataset, 
+                                levels=c("Original", "Imputed")))) +
+           geom_violin(draw_quantiles = c(0.5), alpha=.75) +
+           xlab("Batch") +
+           ylab("Intensity") +
+           scale_fill_manual("Dataset", values=c("#461554", "#27898c")) + 
+           theme_classic() +
+           theme(axis.text = element_text(size=20),
+                 axis.title = element_text(size=20),
+                 legend.text = element_text(size=20),
+                 legend.title = element_text(size=20),
+                 legend.position = c(.15, .85))
+
+filename <- "figures/2/quant_distribution_original_vs_imputed_diss.pdf"
+ggsave(filename, plot = plt, width = 3.5, height = 4)
+# filename <- "figures/2/quant_distribution_original_vs_imputed.pdf"
+# ggsave(filename, plot = plt, width = 6, height = 2)
+show(plt)
+```
+
+I think the effect of the QRILC algorithm is quit clear in the data above.
+The addition of a large mode at the bottom of the distributions
+gives an indication where most of the imputed values lie.
+For some of the data, this looks fine, but it may be somewhat skewed for certain batches.
+
+## 4. Removal of batch effects
+
+Combat is a standard program for batch correction and should work fine to remove most of the effect.
+This dataset will be provided as is for many of the analyses which need corrected data to work.
+For things like differential expression, we will use SVA to analyze the data,
+which avoids some pitfalls with doing t-tests on corrected data.
+
+#### 4.1 Batch effects in the imputed data
+
+```{r, echo=FALSE}
+imputed_matrix <- imputed_data %>%
+                    pivot_wider(id_cols = "run",
+                                names_from = "var",
+                                values_from = "value") %>%
+                    column_to_rownames("run") %>%
+                    as.matrix()
+
+imputed_pca_fit <- imputed_matrix %>%
+                     prcomp(center=TRUE, scale=TRUE)
+```
+
+```{r, echo=FALSE}
+component_limit <- 10
+
+explained_variance <- (imputed_pca_fit$sdev[1:component_limit])**2
+explained_variance <- explained_variance/sum((imputed_pca_fit$sdev)**2)
+explained_variance <- 100 * explained_variance
+
+ggplot() +
+  geom_line(aes(x = 1:component_limit,
+                y = explained_variance)) +
+  geom_point(aes(x = 1:component_limit,
+                 y = explained_variance)) +
+  xlab("Principle Component") +
+  ylab("Explained Variance (%)") +
+  scale_x_continuous(breaks=1:component_limit) +
+  ylim(0, max(explained_variance)) +
+  theme_bw() +
+  theme(axis.text = element_text(size=14),
+        axis.title = element_text(size=16))
+```
+
+```{r, echo=FALSE}
+matched_pca_data <- imputed_pca_fit$x %>%
+                      as.data.frame() %>%
+                      select(PC1, PC2) %>%
+                      rownames_to_column("run") %>%
+                      left_join(meta,
+                                by="run")
+
+plt <- matched_pca_data %>%
+         ggplot(aes(x=PC1, y=PC2, color=as.factor(batch))) +
+           geom_point() +
+           xlab(paste0("Component 1 (", round(explained_variance[1], 2), "%)")) +
+           ylab(paste0("Component 2 (", round(explained_variance[2], 2), "%)")) +
+           scale_color_viridis_d("Batch") +
+           theme_bw() +
+           theme(axis.text = element_text(size=20),
+                 axis.title = element_text(size=24),
+                 legend.text = element_text(size=20),
+                 legend.title = element_text(size=20))
+
+filename <- "figures/2/batch_effect_pca_imputation_data.pdf"
+ggsave(filename, plot = plt, width = 6.5, height = 5)
+show(plt)
+```
+
+The above PCA gives a clear look at the batch effects in the data.
+
+```{r, echo=FALSE}
+exprs <- imputed_matrix %>%
+           t()
+
+pData <- meta %>%
+           column_to_rownames("run") %>%
+           .[colnames(exprs),] %>%
+           select(sample, batch = block) %>%
+           mutate(treatment = sub("\\..*", "", sample, perl=TRUE)) %>%
+           AnnotatedDataFrame()
+
+imputed_eset <- ExpressionSet(assayData=exprs, phenoData=pData)                   
+```
+
+```{r, include=FALSE}
+pvca_results <- pvcaBatchAssess(imputed_eset, 
+                                c("treatment", "batch"), 
+                                0.5)
+```
+
+```{r, echo=FALSE}
+select <- pvca_results$label %in% c("batch", "treatment", "resid")
+
+plt <- ggplot() +
+         geom_bar(aes(x=factor(pvca_results$label[select], 
+                               levels=c("treatment", "batch", "resid")),
+                      y=pvca_results$dat[select]),
+                  stat="identity") +
+         geom_text(aes(x=factor(pvca_results$label[select], 
+                               levels=c("treatment", "batch", "resid")),
+                       y=pvca_results$dat[select] + .05,
+                       label=round(pvca_results$dat[select], 2)),
+                   size=8) + 
+         xlab("Variable group") +
+         ylab("Weighted\naverage proportion\nof variance") +
+         scale_x_discrete(labels=c("Treatment", "Batch", "Residual")) +
+         scale_y_continuous(breaks=c(0., 0.2, 0.4, 0.6, 0.8, 1.0),
+                            limits=c(0., .8)) +
+         theme_classic() +
+         theme(axis.text = element_text(size=20),
+               axis.title = element_text(size=24))
+
+filename <- "figures/2/batch_effect_pvca_imputation_data.pdf"
+ggsave(filename, plot = plt, width = 6.5, height = 5)
+show(plt)
+```
+
+For a more quantified look, I also provide a PVCA analysis above,
+which indicates a majority of the variance can be explained with the batch variable.
+In this case the batch variance encompases both the batch and within batch blocks.
+
+#### 4.2 Overview of corrected data
+
+```{r, echo=FALSE}
+corrected_matrix <- corrected_data %>%
+                      pivot_wider(id_cols = "run",
+                                  names_from = "var",
+                                  values_from = "value") %>%
+                      column_to_rownames("run") %>%
+                      as.matrix()
+
+corrected_pca_fit <- corrected_matrix %>%
+                       prcomp(center=TRUE, scale=TRUE)
+```
+
+```{r, echo=FALSE}
+component_limit <- 10
+
+explained_variance <- (corrected_pca_fit$sdev[1:component_limit])**2
+explained_variance <- explained_variance/sum((corrected_pca_fit$sdev)**2)
+explained_variance <- 100 * explained_variance
+
+ggplot() +
+  geom_line(aes(x = 1:component_limit,
+                y = explained_variance)) +
+  geom_point(aes(x = 1:component_limit,
+                 y = explained_variance)) +
+  xlab("Principle Component") +
+  ylab("Explained Variance (%)") +
+  scale_x_continuous(breaks=1:component_limit) +
+  ylim(0, max(explained_variance)) +
+  theme_bw() +
+  theme(axis.text = element_text(size=14),
+        axis.title = element_text(size=16))
+```
+
+```{r, echo=FALSE}
+matched_pca_data <- corrected_pca_fit$x %>%
+                      as.data.frame() %>%
+                      select(PC1, PC2) %>%
+                      rownames_to_column("run") %>%
+                      left_join(meta,
+                                by="run")
+
+plt <- matched_pca_data %>%
+         ggplot(aes(x=PC1, y=PC2, color=as.factor(batch))) +
+           geom_point() +
+           xlab(paste0("Component 1 (", round(explained_variance[1], 2), "%)")) +
+           ylab(paste0("Component 2 (", round(explained_variance[2], 2), "%)")) +
+           scale_color_viridis_d("Batch") +
+           theme_bw() +
+           theme(axis.text = element_text(size=20),
+                 axis.title = element_text(size=24),
+                 legend.text = element_text(size=20),
+                 legend.title = element_text(size=20))
+
+filename <- "figures/2/batch_effect_pca_corrected_data.pdf"
+ggsave(filename, plot = plt, width = 6.5, height = 5)
+show(plt)
+```
+
+```{r, echo=FALSE}
+exprs <- corrected_matrix %>%
+           t()
+
+pData <- meta %>%
+           column_to_rownames("run") %>%
+           .[colnames(exprs),] %>%
+           select(sample, batch = block) %>%
+           mutate(treatment = sub("\\..*", "", sample, perl=TRUE)) %>%
+           AnnotatedDataFrame()
+
+corrected_eset <- ExpressionSet(assayData=exprs, phenoData=pData)                   
+```
+
+```{r, include=FALSE}
+pvca_results <- pvcaBatchAssess(corrected_eset, 
+                                c("treatment", "batch"), 
+                                0.5)
+```
+
+```{r, echo=FALSE}
+select <- pvca_results$label %in% c("batch", "treatment", "resid")
+
+plt <- ggplot() +
+         geom_bar(aes(x=factor(pvca_results$label[select], 
+                               levels=c("treatment", "batch", "resid")),
+                      y=pvca_results$dat[select]),
+                  stat="identity") +
+         geom_text(aes(x=factor(pvca_results$label[select], 
+                               levels=c("treatment", "batch", "resid")),
+                       y=pvca_results$dat[select] + .05,
+                       label=round(pvca_results$dat[select], 2)),
+                   size=8) +
+         xlab("Variable group") +
+         ylab("Weighted\naverage proportion\nof variance") +
+         scale_x_discrete(labels=c("Treatment", "Batch", "Residual")) +
+         scale_y_continuous(breaks=c(0., 0.2, 0.4, 0.6, 0.8, 1.0),
+                            limits=c(0., .8)) +
+         theme_classic() +
+         theme(axis.text = element_text(size=20),
+               axis.title = element_text(size=24))
+
+filename <- "figures/2/batch_effect_pvca_corrected_data.pdf"
+ggsave(filename, plot = plt, width = 6.5, height = 5)
+show(plt)
+```
+
+#### 5.1 Comparing median correlation between imputed and corrected data
+
+```{r, echo=FALSE}
+imputed_cors <- cor(t(imputed_matrix)) %>%
+                  as.data.frame() %>%
+                  rownames_to_column("run1") %>%
+                  pivot_longer(2:dim(.)[2], names_to="run2") %>%
+                  filter(run1 != run2) %>%
+                  left_join(meta %>% 
+                              mutate(treatment = sub("\\..*", "", sample, perl=TRUE)) %>%
+                              select(run1=run, treatment1=treatment),
+                            by="run1") %>%
+                  left_join(meta %>% 
+                              mutate(treatment = sub("\\..*", "", sample, perl=TRUE)) %>%
+                              select(run2=run, treatment2=treatment),
+                            by="run2") %>%
+                  filter(treatment1 == treatment2)
+
+corrected_cors <- cor(t(corrected_matrix)) %>%
+                    as.data.frame() %>%
+                    rownames_to_column("run1") %>%
+                    pivot_longer(2:dim(.)[2], names_to="run2") %>%
+                    filter(run1 != run2) %>%
+                    left_join(meta %>% 
+                                mutate(treatment = sub("\\..*", "", sample, perl=TRUE)) %>%
+                                select(run1=run, treatment1=treatment),
+                              by="run1") %>%
+                    left_join(meta %>% 
+                                mutate(treatment = sub("\\..*", "", sample, perl=TRUE)) %>%
+                                select(run2=run, treatment2=treatment),
+                              by="run2") %>%
+                    filter(treatment1 == treatment2)
+```
+
+```{r, echo=FALSE}
+inner_join(
+         imputed_cors %>%
+           group_by(treatment1) %>%
+           summarise(medCorImputed = median(value)),
+           corrected_cors %>%
+             group_by(treatment1) %>%
+             summarise(medCorCorrected = median(value)),
+           by="treatment1"
+       ) %>%
+  summarise(median((medCorCorrected - medCorImputed)/medCorImputed))
+```
+
+```{r, echo=FALSE}
+plt <- inner_join(
+         imputed_cors %>%
+           group_by(treatment1) %>%
+           summarise(medCorImputed = median(value)),
+           corrected_cors %>%
+             group_by(treatment1) %>%
+             summarise(medCorCorrected = median(value)),
+           by="treatment1"
+       ) %>%
+         ggplot(aes(x=medCorImputed, y=medCorCorrected)) +
+           geom_point() +
+           geom_abline(aes(slope=1, intercept=0),
+                       linetype="dashed") + 
+           xlab("Median Pearson Corr.\nimputed data") +
+           ylab("Median Pearson Corr.\ncorrected data") +
+           xlim(0.25, .75) +
+           ylim(0.25, .75) +
+           theme_bw() +
+           theme(axis.text = element_text(size=20),
+                 axis.title = element_text(size=24))
+
+filename <- "figures/2/comparison_of_cors.pdf"
+ggsave(filename, plot = plt, width = 5.5, height = 5)
+show(plt)
+```
+
+
+```{r, echo=FALSE}
+inner_join(
+         imputed_cors %>%
+           group_by(treatment1) %>%
+           summarise(medCorImputed = median(value)),
+           corrected_cors %>%
+             group_by(treatment1) %>%
+             summarise(medCorCorrected = median(value)),
+           by="treatment1"
+       ) %>%
+  mutate(improvement = 100*(medCorCorrected - medCorImputed)/medCorImputed) %>%
+  summarise(median(improvement))
+```
+
+#### 5.2 Comparing CVs between imputed and corrected data
+
+```{r, echo=FALSE}
+imputed_cvs <- imputed_data %>%
+                 mutate(treatment = sub("\\..*", "", sample, perl=TRUE)) %>%
+                 group_by(var, treatment) %>%
+                 summarise(sdValue = sd(value),
+                           meanValue = mean(value),
+                           cvValue = sdValue/meanValue,
+                           .groups="drop")
+
+corrected_cvs <- corrected_data %>%
+                   mutate(treatment = sub("\\..*", "", sample, perl=TRUE)) %>%
+                   group_by(var, treatment) %>%
+                   summarise(sdValue = sd(value),
+                             meanValue = mean(value),
+                             cvValue = sdValue/meanValue,
+                             .groups="drop")
+```
+
+```{r, echo=FALSE}
+plt <- inner_join(
+         imputed_cvs %>%
+           group_by(treatment) %>%
+           summarise(medCVImputed = median(cvValue)),
+           corrected_cvs %>%
+             group_by(treatment) %>%
+             summarise(medCVCorrected = median(cvValue)),
+           by="treatment"
+       ) %>%
+         ggplot(aes(x=medCVImputed, y=medCVCorrected)) +
+           geom_point() +
+           geom_abline(aes(slope=1, intercept=0),
+                       linetype="dashed") + 
+           xlab("Median CV imputed data") +
+           ylab("Median CV corrected data") +
+           xlim(0.05, .3) +
+           ylim(0.05, .3) +
+           theme_bw() +
+           theme(axis.text = element_text(size=20),
+                 axis.title = element_text(size=24))
+
+filename <- "figures/2/comparison_of_cvs.pdf"
+ggsave(filename, plot = plt, width = 5.5, height = 5)
+show(plt)
+```
+
+```{r, echo=FALSE}
+inner_join(
+         imputed_cvs %>%
+           group_by(treatment) %>%
+           summarise(medCVImputed = median(cvValue)),
+           corrected_cvs %>%
+             group_by(treatment) %>%
+             summarise(medCVCorrected = median(cvValue)),
+           by="treatment"
+       ) %>%
+  mutate(improvement = 100*(medCVCorrected - medCVImputed)/medCVImputed) %>%
+  summarise(median(improvement))
+```
