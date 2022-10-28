@@ -1,0 +1,2071 @@
+---
+title: "Analysis of Differential Phosphorylation"
+author: "Anthony Barente"
+date: "11/24/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(sva)
+library(limma)
+library(cowplot)
+library(ggdendro)
+library(ggforce)
+library(pvca)
+library(dynamicTreeCut)
+```
+
+## 1. Intro:
+
+As a first step in the analysis of treatment effects,
+we will look at differential expression according to LIMMA.
+The first step in this will be to learn usable representations of the batch effects in the data with SVA.
+The resulting vectors can be fed straight to LIMMA to correct for confounders.
+First we will take the approach of keeping treatments sepparate,
+but once we an understanding of similarity between treatments,
+we will regroup the treatments into contrasts and look for common effects.
+
+## 2. Data Used:
+
+Meta data for this report are available in:
+
+ - `yeast_phospho_data_processed/site_data_v2/meta_runs_samples.csv`
+
+Uncorrected imputed data can be found in:
+
+ - `yeast_phospho_data_processed/site_data_v2/imputation/data_psites.vfilt.50.qrilc.rep1.csv`
+ 
+```{r, echo=FALSE}
+base_path <- "../yeast_phospho_data_processed/site_data_v2/"
+
+original_data <- 
+  read.csv(file.path(base_path, "data_psites.vfilt.50.csv"),
+           stringsAsFactors = FALSE)
+
+imputed_data <-
+  read.csv(file.path(base_path, "imputation/data_psites.vfilt.50.qrilc.rep1.csv"),
+           stringsAsFactors = FALSE)
+
+imputation_labels <- imputed_data %>%
+                       select(run, var) %>%
+                       left_join(original_data %>%
+                                   select(run, var) %>%
+                                   mutate(isImputed=FALSE),
+                                 by=c("run", "var")) %>%
+                       mutate(isImputed = if_else(is.na(isImputed), TRUE, isImputed))
+
+wide_imputed_data <- 
+  imputed_data %>%
+  pivot_wider(id_cols = "var",
+              names_from = "run",
+              values_from = "value") %>%
+  column_to_rownames("var")
+
+meta <- 
+  read.csv(file.path(base_path, "meta_runs_samples.csv"),
+           stringsAsFactors = FALSE)
+
+final_run_meta <- imputed_data %>%
+                    select(run, sample) %>%
+                    mutate(treatment = sub("\\..*", "", sample, perl=TRUE),
+                           treatment = factor(treatment, levels=union(c("UT"), sort(treatment)))) %>%
+                    distinct() %>%
+                      inner_join(meta %>%
+                                   select(run, batch, block) %>%
+                                   filter(batch > 0) %>%
+                                   mutate(block = substr(block,2,2)),
+                                 by = "run") %>%
+                     filter(batch %in% c(2, 3, 5, 6, 7, 8, 9)) %>%
+                     mutate(batch = as.integer(factor(batch)))
+```
+
+```{r, echo=FALSE}
+fix.names <- function(sites) {
+  reference <- gsub("_.*", "", sites)
+  res_pos <- gsub("_", "", gsub("^.*?_", "", sites))
+  name <- read.csv("../phopsho_annotations/gene_annot.csv") %>%
+            column_to_rownames("reference") %>%
+            .[reference,1]
+  return(paste(str_to_title(name), res_pos))
+}
+```
+
+## 3. Surrogate Variable Analysis
+
+The SVA algorithm is set up to find effects in the data which cannot be explained by the treatments.
+This will allow us to go beyond just defined batches and find effects which may be within batch as well.
+Once we have these variables, we will include them directly in our design matrix.
+
+```{r, echo=FALSE}
+model_mat <- model.matrix(~ 1 + treatment, final_run_meta)
+
+n_sv <- num.sv(as.matrix(wide_imputed_data), 
+               model_mat, 
+               method="leek")
+
+sv_obj <- sva(as.matrix(wide_imputed_data),
+              model_mat,
+              model_mat[,1],
+              n.sv=n_sv)
+
+colnames(sv_obj$sv) <- paste0("SV", 1:n_sv)
+rownames(sv_obj$sv) <- colnames(wide_imputed_data)
+```
+
+```{r, echo=FALSE}
+sv_obj$sv %>%
+  write.csv(file="output/sample_surrogate_variables.csv")
+```
+
+#### 3.1 Change in surrogate variables across batches
+
+```{r, echo=FALSE}
+matched_data <- sv_obj$sv %>%
+                  as.data.frame() %>%
+                  rownames_to_column("run") %>%
+                  pivot_longer(2:5, names_to="variable") %>%
+                  left_join(final_run_meta %>%
+                              select(run, batch),
+                            by="run")
+
+matched_data %>%
+  ggplot(aes(x=as.factor(batch), y=value, fill=variable)) +
+    geom_boxplot() +
+    xlab("Measurement Batch") +
+    ylab("Value") +
+    scale_fill_viridis_d("SV") +
+    theme_bw() +
+    theme(axis.text = element_text(size=14),
+          axis.title = element_text(size=16),
+          legend.text = element_text(size=14),
+          legend.title = element_text(size=14))
+```
+
+From this graph, it is apparent that all 4 SVs are picking up major batch effecs in the data.
+In addition, there is significant spread of the variables within batch,
+which we believe implies that SVA is gathering information that is even more fine grained.
+
+#### 3.2 Known batch effect capture with surrogate variables
+```{r, echo=FALSE}
+plt <-
+matched_data %>%
+  pivot_wider(id_cols=c("run", "batch"), names_from="variable") %>%
+  ggplot(aes(x=SV1, y=SV2, color=as.factor(batch))) +
+    geom_point(size=1) +
+    scale_color_viridis_d("Batch") +
+    theme_bw() +
+    theme(axis.text = element_text(size=14),
+          axis.title = element_text(size=16),
+          legend.text = element_text(size=14),
+          legend.title = element_text(size=14))
+
+filename <- "figures/3/surrogate_variable_presentation.svg"
+ggsave(filename, plot = plt, width = 4.25, height = 3)
+plt
+```
+
+Given that SVA works a lot like a PCA, we can see it picking up similar batch sepparation.
+This doesn't give more information than the previous plot besides a different way of visualization.
+
+#### 3.3 Correspondence of surrogate variables with run order
+
+```{r, include=FALSE}
+sv <- "SV1"
+plt <-
+matched_data %>%
+  filter(variable==sv) %>%
+  ggplot(aes(x=as.numeric(factor(run)), y=value)) +
+    geom_point() +
+    facet_grid(col=vars(batch), scales = "free_x") +
+    xlab("Ordered Runs -- Split by batch") +
+    ylab(sv) +
+    theme_bw() +
+    theme(axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.text.y = element_text(size=20),
+          axis.title = element_text(size=20),
+          strip.text = element_text(size=20))
+
+filename <- "figures/3/surrogate_variable_presentation.pdf"
+ggsave(filename, plot = plt, width = 10, height = 2)
+filename <- "figures/3/surrogate_variable_presentation.svg"
+ggsave(filename, plot = plt, width = 10, height = 2)
+knitr::include_graphics(filename)
+```
+
+```{r, echo=FALSE}
+create.plot <- function(df, xlabel=FALSE ,legend=FALSE) {
+  df %>%
+    mutate(index=as.integer(factor(run))) %>%
+    ggplot(aes(x=index, y=value, color=variable)) +
+      geom_point(alpha=.75) +
+      #geom_smooth(formula=y~poly(x, 3), method="lm") +
+      geom_smooth(formula=y~x, method="loess") +
+      xlab("Sample Index") +
+      ylab("SV Value") +
+      ylim(min(df$value), max(df$value)*1.25) +
+      scale_color_manual("Batch", values = c("#000000", "#009E73", "#0072B2", "#D55E00")) +
+      theme_bw() +
+      theme(axis.text = element_text(size=14),
+            axis.title.x = element_text(size=ifelse(xlabel, 16, 0)),
+            axis.title.y = element_text(size=16),
+            legend.text = element_text(size=14),
+            legend.title = element_text(size=14),
+            legend.position = ifelse(legend, "right", "none"))
+}
+
+plt_list <- 1:7 %>%
+              map(function(batch_ind) {
+                    matched_data %>%
+                      filter(batch == batch_ind) %>%
+                      create.plot(xlabel=batch_ind==9)#)legend=batch_ind==2)
+                  })
+
+legend <- data.frame(x=rep(1, 4),
+             y=c(4, 3, 2, 1),
+             labelx=rep(2,4),
+             label=c("SV1", "SV2", "SV3", "SV4")) %>%
+    ggplot() +
+      geom_point(aes(x=x, y=y, color=label),
+                 size=8,
+                 alpha=.75) +
+      geom_text(aes(x=labelx, y=y, label=label),
+                size=8) +
+      scale_color_manual("Batch", values = c("#000000", "#009E73", "#0072B2", "#D55E00")) +
+      xlim(-2, 6) +
+      ylim(-2, 5) +
+      theme_nothing() +
+      theme(legend.position = "none")
+
+plt <- do.call(function(...) {plot_grid(..., legend, ncol=2, nrow=4,
+                                        labels=paste("Batch", 1:7),
+                                        label_x=.125,
+                                        label_y=.975,
+                                        label_fontface="plain")}, 
+               plt_list)
+
+filename <- "figures/3/surrogate_variables_across_time.pdf"
+ggsave(filename, plot = plt, width = 10, height = 8)
+filename <- "figures/3/surrogate_variables_across_time.svg"
+ggsave(filename, plot = plt, width = 10, height = 8)
+knitr::include_graphics(filename)
+```
+
+Sorting the runs by run order clearly gives a demonstration of the additional effects SVA is pulling out.
+Much of this is likely due to the amount of imputation that is occuring per file, but that is fine.
+The main thing is that we did not have to specify these effects, but they are identified anyways.
+
+## 4. Differential phosphorylation with limma
+
+The standard in our lab for differential expression is LIMMA.
+While we tend to use it for standard differential expression against some control,
+the most useful part about it will be the ability to test custom contrasts.
+Many of the treatments we used are directly related to each other and can be grouped together.
+This may reveal common effects that are different from other groupings and increase power.
+To start, we will look at standard differential expression
+and then determine what it can say about treatment similarity.
+
+```{r, echo=FALSE}
+treatment_model_mat <- model_mat
+treatment_fit <- lmFit(wide_imputed_data, treatment_model_mat)
+treatment_eval <- eBayes(treatment_fit)
+
+sv_model_mat <- cbind(model_mat[,1:1], sv_obj$sv)
+sv_fit <- lmFit(wide_imputed_data, sv_model_mat)
+sv_eval <- eBayes(sv_fit)
+
+combined_model_mat <- cbind(model_mat, sv_obj$sv)
+fit <- lmFit(wide_imputed_data, combined_model_mat)
+eval <- eBayes(fit)
+```
+
+#### 4.1 Explained variance
+
+```{r, echo=FALSE}
+imputed_cors <- cor(wide_imputed_data) %>%
+                  as.data.frame() %>%
+                  rownames_to_column("run1") %>%
+                  pivot_longer(2:dim(.)[2], names_to="run2") %>%
+                  filter(run1 != run2) %>%
+                  left_join(final_run_meta %>% 
+                              select(run1=run, treatment1=treatment),
+                            by="run1") %>%
+                  left_join(final_run_meta %>%
+                              select(run2=run, treatment2=treatment),
+                            by="run2") %>%
+                  filter(treatment1 == treatment2)
+
+corrected_matrix <- wide_imputed_data - sv_eval$coefficients[,2:5] %*% t(sv_model_mat[,2:5])
+corrected_cors <- cor(corrected_matrix) %>%
+                    as.data.frame() %>%
+                    rownames_to_column("run1") %>%
+                    pivot_longer(2:dim(.)[2], names_to="run2") %>%
+                    filter(run1 != run2) %>%
+                    left_join(meta %>% 
+                                mutate(treatment = sub("\\..*", "", sample, perl=TRUE)) %>%
+                                select(run1=run, treatment1=treatment),
+                              by="run1") %>%
+                    left_join(meta %>% 
+                                mutate(treatment = sub("\\..*", "", sample, perl=TRUE)) %>%
+                                select(run2=run, treatment2=treatment),
+                              by="run2") %>%
+                    filter(treatment1 == treatment2)
+```
+
+```{r, echo=FALSE}
+inner_join(
+         imputed_cors %>%
+           group_by(treatment1) %>%
+           summarise(medCorImputed = median(value)),
+           corrected_cors %>%
+             group_by(treatment1) %>%
+             summarise(medCorCorrected = median(value)),
+           by="treatment1"
+       ) %>%
+  mutate(improvement = 100*(medCorCorrected-medCorImputed)/medCorImputed) %>%
+  summarise(median(improvement))
+```
+
+```{r, echo=FALSE}
+plt <- inner_join(
+         imputed_cors %>%
+           group_by(treatment1) %>%
+           summarise(medCorImputed = median(value)),
+           corrected_cors %>%
+             group_by(treatment1) %>%
+             summarise(medCorCorrected = median(value)),
+           by="treatment1"
+       ) %>%
+         ggplot(aes(x=medCorImputed, y=medCorCorrected)) +
+           geom_point() +
+           geom_abline(aes(slope=1, intercept=0),
+                       linetype="dashed") +
+           xlab("Median Pearson Corr.\nimputed data") +
+           ylab("Median Pearson Corr.\ncorrected data") +
+           xlim(0.25, .75) +
+           ylim(0.25, .75) +
+           theme_bw() +
+           theme(axis.text = element_text(size=20),
+                 axis.title = element_text(size=24))
+
+filename <- "figures/3/sv_improvement_to_cor.pdf"
+ggsave(filename, plot = plt, width = 5.5, height = 5)
+show(plt)
+```
+
+```{r, echo=FALSE}
+# Calculate residual variance of treatment model
+total_var <- data.frame(variance = apply(wide_imputed_data - treatment_eval$coefficients[,1], 1, var))
+pred <- treatment_eval$coefficients %*% t(treatment_model_mat)
+treatment_resid_var <- data.frame(variance = (total_var-apply(wide_imputed_data-pred, 1, var))/total_var)
+
+# Calculate residual variance of SV model
+total_var <- data.frame(variance = apply(wide_imputed_data - sv_eval$coefficients[,1], 1, var))
+pred <- sv_eval$coefficients %*% t(sv_model_mat)
+sv_resid_var <- data.frame(variance = (total_var-apply(wide_imputed_data - pred, 1, var))/total_var)
+
+# Calculate final residual variance
+total_var <- data.frame(variance = apply(wide_imputed_data - eval$coefficients[,1], 1, var))
+pred <- eval$coefficients %*% t(combined_model_mat)
+final_resid_var <- data.frame(variance = (total_var - apply(wide_imputed_data - pred, 1, var))/total_var)
+
+combined_residual_var <- rbind(treatment_resid_var %>%
+                                 mutate(label="Treatments"),
+                               sv_resid_var %>%
+                                 mutate(label="SVs"),
+                               final_resid_var %>%
+                                 mutate(label="Full Model")) %>%
+                           mutate(label=factor(label, levels=unique(label)))
+```
+
+```{r, echo=FALSE}
+combined_residual_var %>%
+  group_by(label) %>%
+  summarise(median(variance))
+```
+
+```{r, echo=FALSE}
+plt <- combined_residual_var %>%
+         ggplot(aes(x=label, y=variance, fill=label)) +
+           geom_violin(draw_quantiles = .5, alpha=.5) +
+           xlab("Model") +
+           ylab("Proportion of Variance\nExplained") +
+           scale_fill_viridis_d() + 
+           theme_classic() +
+           theme(axis.text = element_text(size=20),
+                 axis.title = element_text(size=24),
+                 legend.position = "none")
+
+filename <- "figures/3/explained_variance_of_models.pdf"
+ggsave(filename, plot = plt, width = 7, height = 5)
+show(plt)
+```
+
+Most of the variance in the data is explained away by the surrogate variables, which is good.
+There is defenitely left over effect from the treatments and that is what we will be interested in next.
+
+```{r, echo=FALSE}
+pred <- treatment_eval$coefficients %*% t(treatment_model_mat)
+treatment_resid_var <- (wide_imputed_data-pred) %>%
+                          as.data.frame() %>%
+                          rownames_to_column("site") %>%
+                          pivot_longer(2:dim(.)[2], names_to="run") %>%
+                          left_join(final_run_meta %>%
+                                      select(run, treatment),
+                                    by="run") %>%
+                          group_by(site, treatment) %>%
+                          summarise(value=var(value),
+                                    .groups="drop")
+
+pred <- eval$coefficients %*% t(combined_model_mat)
+final_resid_var <- (wide_imputed_data-pred) %>%
+                      as.data.frame() %>%
+                      rownames_to_column("site") %>%
+                      pivot_longer(2:dim(.)[2], names_to="run") %>%
+                      left_join(final_run_meta %>%
+                                  select(run, treatment),
+                                by="run") %>%
+                      group_by(site, treatment) %>%
+                      summarise(value=var(value),
+                                .groups="drop")
+```
+
+```{r, include=FALSE}
+inner_join(
+         treatment_resid_var %>%
+           group_by(treatment) %>%
+           summarise(medVarTreatment=median(value)),
+         final_resid_var %>%
+           group_by(treatment) %>%
+           summarise(medVarFull=median(value)),
+         by="treatment"
+       ) %>% arrange(medVarTreatment)
+```
+
+```{r, include=FALSE}
+plt <- inner_join(
+         treatment_resid_var %>%
+           group_by(treatment) %>%
+           summarise(medVarTreatment=median(value)),
+         final_resid_var %>%
+           group_by(treatment) %>%
+           summarise(medVarFull=median(value)),
+         by="treatment"
+       ) %>%
+         ggplot(aes(x=medVarTreatment, y=medVarFull)) +
+           geom_point() +
+           geom_abline(aes(slope=1, intercept=0),
+                       linetype="dashed") + 
+           xlab("Residual Variance\nTreatment Model") +
+           ylab("Residual Variance\nFull Model") +
+           xlim(0., 10) +
+           ylim(0., 10) +
+           theme_bw() +
+           theme(axis.text = element_text(size=20),
+                 axis.title = element_text(size=24))
+
+filename <- "figures/3/resid_var_by_treatment.pdf"
+ggsave(filename, plot = plt, width = 5.5, height = 5)
+show(plt)
+```
+
+```{r, include=FALSE}
+# Calculate residual variance
+pred <- eval$coefficients[,1] + eval$coefficients %*% t(combined_model_mat)
+resid_var <- data.frame(variance = apply(wide_imputed_data - pred, 1, var))
+
+# Calculate SV variance
+ncoef <- dim(eval$coefficients)[2]
+component <- eval$coefficients[,(ncoef-3):ncoef] %*% t(sv_obj$sv)
+sv_var <- data.frame(variance = apply(component, 1, var))
+
+# Calculate treatment variance
+component <- eval$coefficients[,2:(ncoef-4)] %*% t(model_mat[,2:dim(model_mat)[2]])
+treatment_var <- data.frame(variance = apply(component, 1, var))
+
+combined_var <- rbind(resid_var %>%
+                        mutate(label="Resid") %>%
+                        rownames_to_column("site"),
+                      sv_var %>%
+                        mutate(label="SVs") %>%
+                        rownames_to_column("site"),
+                      treatment_var %>%
+                        mutate(label="Treatments") %>%
+                        rownames_to_column("site")) 
+```
+
+```{r, include=FALSE}
+combined_var %>%
+  group_by(site) %>%
+  mutate(variance = variance/sum(variance)) %>%
+  arrange(site, label) %>%
+  ggplot(aes(x=label, y=variance, fill=label)) +
+    geom_violin(draw_quantiles = .5, alpha=.5) +
+    xlab("Variable Group") +
+    ylab("Residual Variance") +
+    scale_fill_viridis_d() + 
+    theme_classic() +
+    theme(axis.text = element_text(size=14),
+          axis.title = element_text(size=16),
+          legend.position = "none")
+```
+
+```{r, echo=FALSE}
+# Build corrected data
+ncoef <- dim(eval$coefficients)[2]
+pred <- eval$coefficients[,1] + eval$coefficients[,(ncoef-3):ncoef] %*% t(sv_obj$sv)
+corrected_data <- wide_imputed_data - pred
+corrected_data <- corrected_data %>%
+                    rownames_to_column("site") %>%
+                    pivot_longer(2:dim(.)[2], names_to="run") %>%
+                    left_join(final_run_meta %>%
+                                select(run, treatment),
+                              by="run")
+```
+
+#### 4.2 Distribution of P-Values at treatment level
+
+```{r, echo=FALSE}
+treatment_coef <- eval$coefficients %>%
+                    as.data.frame() %>%
+                    select(2:(dim(.)[2] - 4)) %>%
+                    rownames_to_column("site") %>%
+                    pivot_longer(2:dim(.)[2], 
+                               names_to="treatment", 
+                               values_to="coef")
+
+coef_p_value <- eval$p.value %>%
+                  as.data.frame() %>%
+                  select(2:(dim(.)[2] - 4)) %>%
+                  rownames_to_column("site") %>%
+                  pivot_longer(2:dim(.)[2], 
+                               names_to="treatment", 
+                               values_to="p.value") %>%
+                  mutate(adj.p.value=p.adjust(p.value, method="BH"))
+```
+
+```{r, echo=FALSE}
+coef_p_value %>%
+  ggplot(aes(x=p.value)) +
+    geom_histogram(bins=100) +
+    xlab("P Value") +
+    ylab("Number of coefficients") +
+    theme_bw() +
+    theme(axis.text = element_text(size=14),
+          axis.title = element_text(size=16))
+```
+
+```{r, echo=FALSE}
+coef_p_value %>%
+  ggplot(aes(x=adj.p.value)) +
+    geom_histogram(bins=100) +
+    xlab("Adjusted P Value") +
+    ylab("Number of coefficients") +
+    theme_bw() +
+    theme(axis.text = element_text(size=14),
+          axis.title = element_text(size=16))
+```
+
+```{r, echo=FALSE}
+limma_results <- left_join(treatment_coef, coef_p_value,
+                           by=c("site", "treatment")) %>%
+                 mutate(treatment = sub("treatment", "", treatment, perl=TRUE)) %>%
+                 mutate(regulated = (adj.p.value < 0.05) & (abs(coef) >= 2))
+
+write.csv(limma_results, file="output/limma_differential_expression_results.csv",
+          row.names = FALSE,
+          quote = FALSE)
+```
+
+The P-value distribution looks good so results have been writen to:
+
+ - `output/limma_diffential_expression_results.csv`
+
+#### 4.3 Determination of significant hits
+
+```{r, echo=FALSE}
+plt <- limma_results %>%
+         ggplot(aes(x=coef, y=-log10(adj.p.value))) +
+           geom_hex(bins=100) +
+           scale_fill_viridis_c("Count", trans = "log10") +
+           xlab("log2 fold change") +
+           ylab("-log10 q-value") +
+           theme_bw() +
+           theme(axis.text = element_text(size=20),
+                 axis.title = element_text(size=24),
+                 legend.text = element_text(size=20),
+                 legend.title = element_text(size=20))
+
+filename <- "figures/3/limma_volcano_plot.pdf"
+ggsave(filename, plot = plt, width = 5.5, height = 3.75)
+show(plt)
+```
+
+This volcano plot seems a little off still. 
+There are large effects which have very low q-values, which makes the volcano plot look very flat.
+We will carry on for now and play around with the testing later to determine if more can be done.
+
+**Full data counts:**
+```{r, echo=FALSE}
+limma_results %>%
+  select(site) %>%
+  mutate(protein = gsub("_.*", "", site)) %>%
+  summarise(nTreatmentSitePairs = n(),
+            nSites = length(unique(site)),
+            nProteins = length(unique(protein)))
+```
+
+**Regulated counts:**
+```{r, echo=FALSE}
+limma_results %>%
+  filter(regulated) %>%
+  select(site) %>%
+  mutate(protein = gsub("_.*", "", site)) %>%
+  summarise(nTreatmentSitePairs = n(),
+            nSites = length(unique(site)),
+            nProteins = length(unique(protein)))
+```
+
+**Regulated 5 min counts:**
+```{r, echo=FALSE}
+limma_results %>%
+  filter(!(treatment %in% c("AF2", "HU2", "NO2", "SP", "LP", "YE"))) %>%
+  filter(regulated) %>%
+  select(site) %>%
+  mutate(protein = gsub("_.*", "", site)) %>%
+  summarise(nTreatmentSitePairs = n(),
+            nSites = length(unique(site)),
+            nProteins = length(unique(protein)))
+```
+
+```{r, echo=FALSE}
+regulated_stats = data.frame(filter = rep(c("Unfiltered", "Regulated", "Regulated 5 min"), 2),
+                             type = c(rep("Site", 3), rep("Protein", 3)),
+                             count = c(5294, 4477, 4039, 1390, 1281, 1202)) %>%
+                    mutate(type = factor(type, levels = c("Site", "Protein")),
+                           filter=factor(filter, levels=c("Unfiltered", "Regulated", "Regulated 5 min")))
+
+plt <- regulated_stats %>% 
+         ggplot(aes(x=type, y=count, fill=filter)) +
+           geom_bar(stat="identity", position = "dodge", alpha=.8) +
+           geom_text(aes(x=as.integer(type) + .3*(as.integer(filter) - 2),
+                         y=count + 400,
+                         label=count),
+                     size=7) +
+           scale_fill_viridis_d("Statistic") +
+           scale_y_continuous(breaks=1000*(0:5)) +
+           xlab("") + 
+           ylab("Count") +
+           theme_bw() +
+           theme(axis.text = element_text(size=20),
+                 axis.title = element_text(size=20),
+                 legend.title = element_text(size=20),
+                 legend.text = element_text(size=20),
+                 legend.position = c(0.75, 0.75))
+
+filename <- "figures/3/limma_counts.pdf"
+ggsave(filename, plot = plt, width = 7, height = 3.5)
+filename <- "figures/3/limma_counts.svg"
+ggsave(filename, plot = plt, width = 7, height = 3.5)
+knitr::include_graphics(filename)
+```
+
+#### 4.4 Differentially regulated sites per treatment
+
+```{r, echo=FALSE}
+sites_per_treat <- limma_results %>%
+                     mutate(treatment = sub("treatment", "", treatment, perl=TRUE)) %>%
+                     filter(!(treatment %in% c("AF2", "HU2", "NO2", "SP", "LP", "YE"))) %>%
+                     filter(regulated) %>%
+                     group_by(treatment) %>%
+                     summarise(up = sum(coef > 0),
+                               down = sum(coef < 0),
+                               total = n())
+```
+
+```{r, echo=FALSE}
+plt <- sites_per_treat %>%
+         ggplot(aes(x=log10(total))) +
+           geom_histogram(bins=15) +
+           xlab("Log10 number of regulated sites") +
+           ylab("Treatment count") +
+           ylim(0, 15) +
+           theme_bw() +
+           theme(axis.text = element_text(size=20),
+                 axis.title = element_text(size=20))
+
+filename <- "figures/3/treatment_count_histogram.pdf"
+ggsave(filename, plot = plt, width = 5, height = 2.5)
+show(plt)
+```
+
+```{r, echo=FALSE}
+pos_df <- sites_per_treat %>%
+            select(treatment) %>%
+            distinct() %>%
+            ungroup() %>%
+            mutate(ind = 1:n(),
+                   facet = floor(4*pmin(ind, 100)/n()))
+
+create.plot <- function(df, legend=FALSE) {
+  df %>%
+    ggplot(aes(x=treatment, y=total)) + 
+      geom_bar(stat="identity") +
+      scale_y_continuous(breaks=c(0, 250, 500, 750), limits = c(0, 750)) +
+      ylab("Hits") +
+      theme_bw() +
+      theme(axis.text.x = element_text(size=20, angle = 90, vjust = 0.5, hjust=1),
+            axis.text.y = element_text(size=18),
+            axis.title.x = element_blank(),
+            axis.title.y = element_text(size=20))
+}
+
+plt1 <- sites_per_treat %>%
+          left_join(pos_df, by="treatment") %>%
+          filter(facet == 0) %>%
+          create.plot()
+
+plt2 <- sites_per_treat %>%
+          left_join(pos_df, by="treatment") %>%
+          filter(facet == 1) %>%
+          create.plot()
+
+plt3 <- sites_per_treat %>%
+          left_join(pos_df, by="treatment") %>%
+          filter(facet == 2) %>%
+          create.plot()
+
+plt4 <- sites_per_treat %>%
+          left_join(pos_df, by="treatment") %>%
+          filter(facet == 3) %>%
+          create.plot()
+
+plt <- plot_grid(plt1, plt2, plt3, plt4, nrow=4)
+
+filename <- "figures/3/treatment_counts.pdf"
+ggsave(filename, plot = plt, width = 10, height = 7)
+filename <- "figures/3/treatment_counts.svg"
+ggsave(filename, plot = plt, width = 10, height = 7)
+knitr::include_graphics(filename)
+```
+
+As we have seen in other analyses the SP condition definitely sticks out like a sore thumb.
+
+```{r, echo=FALSE}
+plt <- sites_per_treat %>%
+         ggplot(aes(x=down, y=up)) +
+           geom_point() +
+           geom_abline(aes(intercept=0, slope=1)) +
+           xlab("Number of downregulated") +
+           ylab("Number of upregulated") +
+           scale_x_continuous(breaks=c(0., 1., 10., 100., 1000.),
+                              limits=c(0, 1500),
+                              trans="pseudo_log") +
+           scale_y_continuous(breaks=c(0., 1., 10., 100., 1000.),
+                              limits=c(0, 1500),
+                              trans="pseudo_log") +
+           theme_bw() +
+           theme(axis.text = element_text(size=20),
+                 axis.title = element_text(size=24))
+
+filename <- "figures/3/number_up_vs_down_coefficients.pdf"
+ggsave(filename, plot = plt, width = 5.5, height = 5)
+show(plt)
+```
+
+```{r, echo=FALSE}
+limma_results %>%
+  group_by(treatment) %>%
+  summarise(median_down = median(coef[coef < 0.]),
+            median_up = median(coef[coef > 0.])) %>%
+  replace(is.na(.), 0.) %>%
+  ggplot(aes(x = median_down, y=median_up)) +
+    geom_point() +
+    geom_abline(aes(intercept=0, slope=-1)) +
+    xlab("Median signal - downregulation") +
+    ylab("Median signal - upregulation") +
+    xlim(-2, 0) +
+    ylim(0, 2) +
+    theme_bw() +
+    theme(axis.text = element_text(size=20),
+          axis.title = element_text(size=24))
+```
+
+Looking at the above plot it is clear that almost all the regulatory effect is down regulation.
+There is definitely some up-regulation present but it makes up a minority of the effect comparatively.
+
+```{r, echo=FALSE}
+count_by_imp <- limma_results %>%
+                  filter(regulated) %>%
+                  group_by(site) %>%
+                  summarise(down = sum(coef < 0),
+                            up = sum(coef > 0),
+                            prop_down = down / (up + down)) %>%
+                  left_join(imputation_labels %>%
+                  group_by(var) %>%
+                  summarise(percImputed = sum(isImputed)/n()),
+                            by=c("site" = "var"),
+                            how="left")
+```
+
+```{r, echo=FALSE}
+plt <- count_by_imp %>% 
+         mutate(group=cut(percImputed, breaks = 4)) %>%
+         group_by(group) %>%
+         summarise(prop_down=sum(down > up)/n(),
+                   n = n()) %>%
+         ggplot(aes(x=group, y=prop_down)) +
+           geom_bar(stat="identity") +
+           geom_text(aes(y=prop_down + .15, label=round(prop_down, 2)),
+                     size=7) +
+           geom_text(aes(y=prop_down + .06, label=paste("n =", n)),
+                     size=7) + 
+           scale_x_discrete(labels=c("0%-12.5%", 
+                                     "12.5%-25%",
+                                     "25%-37.5%",
+                                     "37.5%-50%")) +
+           ylim(0, 1) +
+           xlab("Missingness") +
+           ylab("Proportion of sites\nwhere down > up") +
+           theme_classic() +
+           theme(axis.text = element_text(size=18),
+                 axis.title = element_text(size=20))
+
+filename <- "figures/3/over_representation_of_downregulation_by_missingness.pdf"
+ggsave(filename, plot = plt, width = 7, height = 3.5)
+show(plt)
+```
+
+There was some worry that the over abundance of downregulation could be an artifact of imputation.
+However, the over-representation of down regulation vs up regulation is anti-correlated with
+imputation, which seems to imply the that this a real effect of highly expressed sites.
+
+#### 4.5 Amount of regulation by site
+
+```{r, echo=FALSE}
+plt <- limma_results %>%
+         filter(!(treatment %in% c("AF2", "HU2", "NO2", "SP", "LP", "YE"))) %>%
+         group_by(site) %>%
+         summarise(sig_count = sum(regulated),
+                   .groups="drop") %>%
+         mutate(sig_count = sig_count*(sig_count <= 30) + 30*(sig_count > 30)) %>%
+         ggplot(aes(x=sig_count)) +
+           geom_bar() +
+           xlab("Number of significant coefficients") +
+           ylab("Number of\nphosphosites") +
+           scale_x_continuous(labels=c("0", "10", "20", ">=30")) +
+           theme_bw() +
+           theme(axis.text = element_text(size=24),
+                 axis.title = element_text(size=26))
+
+filename <- "figures/3/number_significant_coefficients_by_site.pdf"
+ggsave(filename, plot = plt, width = 7, height = 2.5)
+show(plt)
+```
+
+```{r, echo=FALSE}
+find.breakpoint <- function(df) {
+  breakpoint <- seq(3, dim(df)[1] - 4)
+  error <- rep(0., length(breakpoint))
+  for (i in 1:length(breakpoint)){
+    cur_break = breakpoint[i]
+    left_df <- df[1:cur_break,] %>% 
+                 mutate(logn = log10(n))
+    left_fit <- lm(logn ~ sig_count, left_df)
+    error[i] <- sum((left_df$logn - predict(left_fit))^2)
+  
+    right_df <- df[(cur_break+1):dim(df)[1],] %>% 
+                  mutate(logn = log10(n))
+    right_fit <- lm(logn ~ sig_count, right_df)
+    error[i] <- error[i] + sum((right_df$logn - predict(right_fit))^2)
+  }
+  
+  return(breakpoint[error == min(error)])
+}
+```
+
+```{r, echo=FALSE}
+n_treat_count <- limma_results %>%
+                   filter(!(treatment %in% c("AF2", "HU2", "NO2", "SP", "LP", "YE"))) %>%
+                   group_by(site) %>%
+                   summarise(sig_count = sum(regulated),
+                             .groups="drop") %>%
+                   mutate(sig_count = sig_count*(sig_count <= 30) + 30*(sig_count > 30)) %>%
+                   group_by(sig_count) %>%
+                   count()
+cur_break <- find.breakpoint(n_treat_count)
+
+plt <- ggplot()  +
+         geom_smooth(data=n_treat_count %>% filter(sig_count <= cur_break),
+                     mapping=aes(x=sig_count, y=log10(n)),
+                     formula="y~x",
+                     method=lm,
+                     se=FALSE,
+                     color="black",
+                     alpha=.5,
+                     linetype="dashed",
+                     size=2,
+                     fullrange=TRUE) +
+         geom_smooth(data=n_treat_count %>% filter(sig_count > cur_break),
+                     mapping=aes(x=sig_count, y=log10(n)),
+                     formula="y~x",
+                     method=lm,
+                     se=FALSE,
+                     color="black",
+                     alpha=.5,
+                     linetype="dashed",
+                     size=2,
+                     fullrange=TRUE) +
+         geom_point(data=n_treat_count,
+                    mapping=aes(x=sig_count, y=log10(n)),
+                    stat="identity",
+                    color="#27898c",
+                    alpha=.9,
+                    size=5) +
+         scale_x_continuous(labels=c("0", "10", "20", ">=30")) +
+         xlab("Number of significant coefficients") +
+         ylab("log10 number of\nphosphosites") +
+         ylim(0, 3.5) +
+         theme_bw() +
+         theme(axis.text = element_text(size=24),
+               axis.title = element_text(size=26))
+
+filename <- "figures/3/number_significant_coefficients_by_site_exponential_fit.pdf"
+ggsave(filename, plot = plt, width = 7, height = 2.5)
+show(plt)
+```
+
+```{r, echo=FALSE}
+n_treat_count <- limma_results %>%
+                   filter(!(treatment %in% c("AF2", "HU2", "NO2", "SP", "LP", "YE"))) %>%
+                   group_by(site) %>%
+                   summarise(sig_count = sum(regulated & coef < 0),
+                             .groups="drop") %>%
+                   mutate(sig_count = sig_count*(sig_count <= 30) + 30*(sig_count > 30)) %>%
+                   group_by(sig_count) %>%
+                   count()
+cur_break <- find.breakpoint(n_treat_count)
+
+plt <- ggplot()  +
+         geom_smooth(data=n_treat_count %>% filter(sig_count <= cur_break),
+                     mapping=aes(x=sig_count, y=log10(n)),
+                     formula="y~x",
+                     method=lm,
+                     se=FALSE,
+                     color="black",
+                     alpha=.5,
+                     linetype="dashed",
+                     size=2,
+                     fullrange=TRUE) +
+         geom_smooth(data=n_treat_count %>% filter(sig_count > cur_break),
+                     mapping=aes(x=sig_count, y=log10(n)),
+                     formula="y~x",
+                     method=lm,
+                     se=FALSE,
+                     color="black",
+                     alpha=.5,
+                     linetype="dashed",
+                     size=2,
+                     fullrange=TRUE) +
+         geom_point(data=n_treat_count,
+                    mapping=aes(x=sig_count, y=log10(n)),
+                    stat="identity",
+                    color="#27898c",
+                    alpha=.9,
+                    size=5) +
+         scale_x_continuous(labels=c("0", "10", "20", ">=30")) +
+         xlab("Number of significant coefficients") +
+         ylab("log10 number of\nphosphosites") +
+         ylim(0, 3.5) +
+         theme_bw() +
+         theme(axis.text = element_text(size=24),
+               axis.title = element_text(size=26))
+
+filename <- "figures/3/number_significant_coefficients_by_site_exponential_fit_down.pdf"
+ggsave(filename, plot = plt, width = 7, height = 2.5)
+show(plt)
+```
+
+```{r, echo=FALSE}
+n_treat_count <- limma_results %>%
+                   filter(!(treatment %in% c("AF2", "HU2", "NO2", "SP", "LP", "YE"))) %>%
+                   group_by(site) %>%
+                   summarise(sig_count = sum(regulated & coef > 0),
+                             .groups="drop") %>%
+                   mutate(sig_count = sig_count*(sig_count <= 30) + 30*(sig_count > 30)) %>%
+                   group_by(sig_count) %>%
+                   count()
+cur_break <- find.breakpoint(n_treat_count)
+
+plt <- ggplot()  +
+         geom_smooth(data=n_treat_count %>% filter(sig_count <= cur_break),
+                     mapping=aes(x=sig_count, y=log10(n)),
+                     formula="y~x",
+                     method=lm,
+                     se=FALSE,
+                     color="black",
+                     alpha=.5,
+                     linetype="dashed",
+                     size=2,
+                     fullrange=TRUE) +
+         geom_smooth(data=n_treat_count %>% filter(sig_count > cur_break),
+                     mapping=aes(x=sig_count, y=log10(n)),
+                     formula="y~x",
+                     method=lm,
+                     se=FALSE,
+                     color="black",
+                     alpha=.5,
+                     linetype="dashed",
+                     size=2,
+                     fullrange=TRUE) +
+         geom_point(data=n_treat_count,
+                    mapping=aes(x=sig_count, y=log10(n)),
+                    stat="identity",
+                    color="#27898c",
+                    alpha=.9,
+                    size=5) +
+         scale_x_continuous(labels=c("0", "10", "20", ">=30")) +
+         xlab("Number of significant coefficients") +
+         ylab("log10 number of\nphosphosites") +
+         ylim(0, 4) +
+         theme_bw() +
+         theme(axis.text = element_text(size=24),
+               axis.title = element_text(size=26))
+
+filename <- "figures/3/number_significant_coefficients_by_site_exponential_fit_up.pdf"
+ggsave(filename, plot = plt, width = 7, height = 2.5)
+show(plt)
+```
+
+The above plots show that there is a break point in the amount of treatments where
+sites are regulated. This seems to imply that some sites are more prone to be
+regulated in many treatments, possibly because of their importance.
+
+```{r, echo=FALSE}
+plt <- limma_results %>%
+         mutate(protein = gsub("_.*", "", site)) %>%
+         group_by(protein, site) %>%
+         summarise(sig_count = sum(regulated),
+                  .groups="drop") %>%
+         group_by(protein) %>%
+         summarise(total_sites = n(),
+                   sig_count = sum(sig_count > 0),
+                   .groups="drop") %>%
+         filter(total_sites > 1) %>%
+         summarise(var1_nmultisite = n(),
+                   var2_nsinglesig = sum(sig_count==1),
+                   var3_nmultisig = sum(sig_count > 1)) %>%
+         pivot_longer(1:dim(.)[2]) %>%
+         ggplot(aes(x=name, y=value)) +
+         geom_bar(stat="identity") +
+           geom_text(aes(x=name, y=value + 50, label=value),
+                     size=6) +
+           xlab("") +
+           ylab("Number of proteins") +
+           scale_x_discrete(labels=c("# detected > 1",
+                                     "# detected > 1\n# regulated = 1", 
+                                     "# detected > 1\n# regulated > 1")) +
+           theme_bw() +
+           theme(axis.text = element_text(size=16),
+                 axis.title = element_text(size=18))
+
+filename <- "figures/3/nregulated_sites_for_multisite_proteins.pdf"
+ggsave(filename, plot = plt, width = 6.5, height = 6.5)
+show(plt)
+```
+
+```{r, echo=FALSE}
+selected_proteins <- limma_results %>%
+                       mutate(protein = gsub("_.*", "", site)) %>%
+                       group_by(protein, site) %>%
+                       summarise(sig_count = sum(adj.p.value < 0.01),
+                                 .groups="drop") %>%
+                       group_by(protein) %>%
+                       summarise(sig_count = sum(sig_count > 0),
+                                 .groups="drop") %>%
+                       filter(sig_count > 1)
+```
+
+#### 4.6 Similarity of effects between treatments
+
+```{r, echo=FALSE}
+selected_treatments <- limma_results %>%
+                         filter(!(treatment %in% c("AF2", "HU2", "NO2", "SP", "LP", "YE"))) %>%
+                         filter(regulated) %>%
+                         group_by(treatment) %>%
+                         count() %>%
+                         ungroup() %>%
+                         filter(n >= median(n)) %>%
+                         select(treatment)
+
+selected_sites <- limma_results %>%
+                    right_join(selected_treatments,
+                               by="treatment") %>%
+                    filter(regulated) %>%
+                    distinct(site)
+```
+
+```{r, echo=FALSE}
+selected_sites %>%
+  mutate(protein = gsub("_.*", "", site)) %>%
+  distinct(protein) %>%
+  write.csv("output/limma_selected_proteins.csv",
+            row.names=FALSE,
+            quote=FALSE)
+```
+
+```{r, echo=FALSE}
+treatment_corr <- limma_results %>%
+                    right_join(selected_treatments,
+                               by="treatment") %>%
+                    right_join(selected_sites,
+                               by="site") %>%
+                    pivot_wider(id_cols="site", names_from="treatment", values_from="coef") %>%
+                    column_to_rownames("site") %>%
+                    cor()
+```
+
+```{r, echo=FALSE}
+treatment_corr_order <- hclust(as.dist(1-treatment_corr))
+plt <- ggdendrogram(treatment_corr_order, rotate = FALSE, size = 1) +
+         theme(axis.text.x = element_text(size=16),
+               axis.text.y = element_blank())
+
+filename <- "figures/3/selected_treatment_cor_dendrogram.pdf"
+ggsave(filename, plot = plt, width = 10, height = 1.5)
+filename <- "figures/3/selected_treatment_cor_dendrogram.svg"
+ggsave(filename, plot = plt, width = 10, height = 1.5)
+knitr::include_graphics(filename)
+```
+
+```{r, echo=FALSE}
+treatment_groups <-
+  read.csv("../yeast_phospho_data/ml036_dia_quant_perturbation_v2/meta_conditions.csv",
+         stringsAsFactors = FALSE) %>%
+  select(cond, type) %>%
+  filter(cond != "UT") %>%
+  column_to_rownames("cond") %>%
+  .[as.character(treatment_corr_order$labels)[treatment_corr_order$order],]
+
+plt <- ggplot() +
+  geom_bar(aes(x=1:length(treatment_groups),
+               y=rep(1, length(treatment_groups)),
+               fill=treatment_groups),
+           stat="identity",
+           width=1,
+           alpha=.8) +
+  scale_fill_manual("Perurbation\ntype",
+                     values=c("#90ad1c", "#f6222e", "#dea0fd", "#1cffce",
+                              "#325a9b", "#e2e2e2", "#1c8356", "#f8a19f",
+                              "#fe00fa", "#fbe426", "#3283fe", "#16ff32",
+                              "#aa0dfe")) +
+  # scale_fill_manual("Perurbation\ntype",
+  #                    values=c("#8fab19", "#f5212e", "#de9efd", "#19ffcc",
+  #                             "#305999", "#e1e1e1", "#198254", "#f8a19e",
+  #                             "#85630c", "#fd00fa", "#545454", "#fae323",
+  #                             "#3082fd", "#14ff30", "#a80cfd")) +
+  scale_x_continuous(expand = c(0., 0.)) +
+  theme_nothing() + 
+  theme(axis.text = element_blank(),
+        axis.title.y = element_text(vjust = -7),
+        legend.position = "none")
+
+filename <- "figures/3/selected_treatment_cor_tree_perturbation_type.pdf"
+ggsave(filename, plot = plt, width = 8, height = .3)
+filename <- "figures/3/selected_treatment_cor_tree_perturbation_type.svg"
+ggsave(filename, plot = plt, width = 8, height = .3)
+knitr::include_graphics(filename)
+```
+
+```{r, echo=FALSE}
+treat_clust <- cutreeDynamic(dendro = treatment_corr_order, distM = as.dist(1-treatment_corr),
+                             deepSplit = TRUE, method = "tree", minClusterSize = 3)
+treat_clust <- data.frame(treatment = treatment_corr_order$labels,
+                          order = order(treatment_corr_order$order),
+                          cluster = cutree(treatment_corr_order, 4)) %>%
+               arrange(order) %>%
+               mutate(cluster = as.integer(factor(cluster, levels=unique(cluster))))
+treat_clust %>%
+  write.csv("output/treatment_clusters.csv",
+            quote=FALSE, row.names = FALSE)
+
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73",
+               "#F0E442", "#0072B2", "#D55E00", "#CC79A7")[-1]
+plt <- ggplot() +
+           geom_bar(aes(x=1:dim(treat_clust)[1],
+                    y=rep(1, dim(treat_clust)[1]),
+                    fill=as.factor(treat_clust$cluster)),
+                    stat="identity",
+                    width = 1,
+                    alpha=.8) +
+           geom_text(data=treat_clust %>%
+                            group_by(cluster) %>%
+                            summarise(pos = median(order)) %>%
+                            filter(cluster > 0),
+                     aes(x=pos, y=.5, label=cluster),
+                     size=5) +
+           scale_x_continuous(expand = c(0., 0.)) +
+           scale_fill_manual(values = cbPalette) +
+           theme_nothing() + 
+           theme(axis.text = element_blank(),
+                 axis.title.y = element_text(vjust = -7),
+                 legend.position = "none")
+
+filename <- "figures/3/selected_treatment_cor_tree_cluster.pdf"
+ggsave(filename, plot = plt, width = 8, height = .3)
+filename <- "figures/3/selected_treatment_cor_tree_cluster.svg"
+ggsave(filename, plot = plt, width = 8, height = .3)
+knitr::include_graphics(filename)
+```
+
+```{r, echo=FALSE}
+plt <- treatment_corr %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(2:dim(.)[2], names_to="var2") %>%
+  mutate(var1 = factor(var1, levels = treatment_corr_order$labels[treatment_corr_order$order]),
+         var2 = factor(var2, levels = treatment_corr_order$labels[treatment_corr_order$order])) %>%
+  mutate(value = ifelse(var1==var2, NA, value)) %>%
+  ggplot(aes(x=var1, y=var2, fill=value)) +
+    geom_tile() +
+    scale_fill_viridis_c("Corr.",
+                         breaks=c(0.0, 0.25, 0.5, 0.75)) +
+    xlab("Treatment") + 
+    ylab("Treatment") +
+    theme_classic() + 
+    theme(axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title = element_text(size=24),
+          legend.text = element_text(size=18, angle=-90, hjust = 0),
+          legend.title = element_text(size=20),
+          legend.position = "top")
+
+filename <- "figures/3/selected_treatment_cor.pdf"
+ggsave(filename, plot = plt, width = 8, height = 8.75)
+filename <- "figures/3/selected_treatment_cor.svg"
+ggsave(filename, plot = plt, width = 8, height = 8.75)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, echo=FALSE}
+sentinels <- read.csv("../phopsho_annotations/sentinel_psites.csv")
+sentinel_zscores <- limma_results %>%
+                      inner_join(selected_sites,
+                                 by="site") %>%
+                      inner_join(sentinels,
+                                 by=c("site" = "ref")) %>%
+                      inner_join(treat_clust,
+                                 by="treatment") %>%
+                      mutate(fixedSite = fix.names(site)) %>%
+                      group_by(Sentinel, fixedSite, cluster) %>%
+                      summarise(meanCoef = mean(coef),
+                                sdCoef = sd(coef),
+                                zScoreCoef = meanCoef/sdCoef, #max(min(meanCoef/sdCoef, 2), -2),
+                                .groups="drop") %>%
+                      filter(!is.na(zScoreCoef)) %>%
+                      filter(str_detect(Sentinel, "kinase activity")) %>%
+                      mutate(protein = str_split(Sentinel, " ", simplify = TRUE)[,1])
+                      
+plt <- sentinel_zscores %>%
+  right_join(sentinel_zscores %>%
+               group_by(Sentinel) %>%
+               summarise(maxAbsZ = max(abs(zScoreCoef))) %>%
+               filter(maxAbsZ > 1.5),
+             by="Sentinel") %>% 
+  distinct(fixedSite, cluster, .keep_all=TRUE) %>%
+  group_by(fixedSite, cluster) %>%
+  mutate(meanCoef = max(min(meanCoef, 3), -3)) %>%
+  ggplot(aes(x=as.factor(cluster), y=fixedSite, fill=meanCoef)) +
+    #facet_grid(rows=vars(Sentinel), scales="free", space="free") +
+    ggforce::facet_col(facets=vars(protein),
+                       scales="free",
+                       space="free") + 
+    geom_tile() +
+    scale_fill_distiller("log2FC", palette = "RdBu", direction = -1, limits = c(-3, 3)) +
+    xlab("Cluster") +
+    theme_bw() +
+    theme(axis.text = element_text(size=16),
+          axis.title.y = element_blank(),
+          strip.text.x = element_text(size = 16),
+          legend.text = element_text(size = 16),
+          legend.title = element_text(size = 16))
+
+filename <- "figures/3/selected_treatment_cluster_sentinels.pdf"
+ggsave(filename, plot = plt, width = 5, height = 12)
+filename <- "figures/3/selected_treatment_cluster_sentinels.svg"
+ggsave(filename, plot = plt, width = 5, height = 12)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, echo=FALSE}
+cluster_regulated_count <- limma_results %>%
+                             inner_join(treat_clust,
+                                        "treatment") %>%
+                             group_by(site, cluster) %>%
+                             summarise(regulated = sum(regulated),
+                                       total = n(),
+                                       .groups="drop") %>%
+                             mutate(prop = regulated/total) %>%
+                             group_by(site) %>%
+                             mutate(skew = sum(abs(prop/sum(prop)-.25))) %>%
+                             ungroup()
+
+interesting_sites <- cluster_regulated_count %>%
+                       filter(regulated >= 2*total/3) %>%
+                       distinct(site)
+
+ranked_sites <- cluster_regulated_count %>%
+                  right_join(interesting_sites,
+                             by="site") %>%
+                  arrange(desc(prop)) %>%
+                  group_by(site) %>%
+                  mutate(max_skew = first(skew),
+                         max_cluster = first(cluster)) %>%
+                  ungroup() %>%
+                  distinct(site, max_skew, max_cluster) %>%
+                  filter(max_skew > quantile(max_skew, .8, na.rm=TRUE)) %>%
+                  arrange(desc(max_skew)) %>%
+                  group_by(max_cluster) %>%
+                  mutate(rank = 1:n()) %>%
+                  ungroup() %>%
+                  select(site, max_cluster, rank)
+```
+
+```{r, echo=FALSE}
+cluster_regulated_count %>%
+  write.csv(file="output/treatment_cluster_site_skew.csv")
+
+cluster_regulated_count %>%
+  right_join(ranked_sites,
+             by="site") %>%
+  write.csv(file="output/treatment_cluster_site_skew_ranked_filtered.csv")
+```
+
+```{r, echo=FALSE}
+plt <-
+cluster_regulated_count %>%
+  right_join(ranked_sites %>%
+               filter(rank <= 5),
+             by="site") %>%
+  arrange(desc(max_cluster), desc(rank), site) %>%
+  mutate(site=factor(fix.names(site), levels=fix.names(unique(site)))) %>%
+  ggplot(aes(x=cluster, y=site, fill=prop)) + 
+    geom_tile(alpha=.8) +
+    xlab("Cluster") +
+    scale_fill_viridis_c("Proportion\nof treatments") +
+    scale_x_continuous(expand = c(0., 0.)) +
+    theme_classic() +
+    theme(axis.text = element_text(size=14),
+          axis.title.x = element_text(size=16),
+          axis.title.y = element_blank(),
+          legend.title = element_text(size=14),
+          legend.text = element_text(size=14))
+
+filename <- "figures/3/selected_treatment_cluster_interesting_sites.pdf"
+ggsave(filename, plot = plt, width = 5, height = 4)
+filename <- "figures/3/selected_treatment_cluster_interesting_sites.svg"
+ggsave(filename, plot = plt, width = 5, height = 4)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, include=FALSE}
+limma_results %>%
+    inner_join(treat_clust,
+               "treatment") %>%
+    filter(site=="YPR115W_T_817") %>%
+    arrange(cluster, order) %>%
+    select(treatment, coef, regulated, cluster)
+```
+
+```{r, echo=FALSE}
+treatment_pca <- limma_results %>%
+                   right_join(selected_treatments,
+                              by="treatment") %>%
+                   right_join(selected_sites,
+                              by="site") %>%
+                   pivot_wider(id_cols="treatment", names_from="site", values_from="coef") %>%
+                   column_to_rownames("treatment") %>%
+                   as.matrix() %>%
+                   prcomp(center=TRUE, scale.=TRUE)
+```
+
+```{r, echo=FALSE}
+var_prop <- 100*(treatment_pca$sdev)**2/sum((treatment_pca$sdev)**2)
+plt <- ggplot() +
+         geom_text(aes(x=treatment_pca$x[,1],
+                       y=treatment_pca$x[,2],
+                       label=rownames(treatment_pca$x)),
+                   size=5) +
+         xlab(paste("PC1 (", round(var_prop[1], 2), "%)", sep="")) +
+         ylab(paste("PC2 (", round(var_prop[2], 2), "%)", sep="")) +
+         theme_bw() +
+         theme(axis.text = element_text(size=22),
+               axis.title = element_text(size=22))
+
+filename <- "figures/3/selected_treatment_pca12.pdf"
+ggsave(filename, plot = plt, width = 5.25, height = 5)
+filename <- "figures/3/selected_treatment_pca12.svg"
+ggsave(filename, plot = plt, width = 5.25, height = 5)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, echo=FALSE}
+plt <- ggplot() +
+         geom_text(aes(x=treatment_pca$x[,3],
+                       y=treatment_pca$x[,4],
+                       label=rownames(treatment_pca$x)),
+                   size=5) +
+         xlab(paste("PC3 (", round(var_prop[3], 2), "%)", sep="")) +
+         ylab(paste("PC4 (", round(var_prop[4], 2), "%)", sep="")) +
+         theme_bw() +
+         theme(axis.text = element_text(size=22),
+               axis.title = element_text(size=22))
+
+filename <- "figures/3/selected_treatment_pca34.pdf"
+ggsave(filename, plot = plt, width = 5.25, height = 5)
+filename <- "figures/3/selected_treatment_pca34.svg"
+ggsave(filename, plot = plt, width = 5.25, height = 5)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, include=FALSE}
+ treatment_pca$rotation %>%
+         as.data.frame() %>%
+         select(PC1) %>%
+         rownames_to_column("ref") %>%
+         left_join(read.csv("../phopsho_annotations/motif_class.csv",
+                            row.names = 1, stringsAsFactors=FALSE) %>%
+                     mutate(ref = str_replace(ref, "_([STY])", "_\\1_")),
+                   by="ref") %>%
+         arrange(-abs(PC1))
+```
+
+```{r, echo=FALSE}
+plt <- treatment_pca$rotation %>%
+         as.data.frame() %>%
+         select(PC1) %>%
+         arrange(-abs(PC1)) %>%
+         mutate(rank=1:dim(.)[1])  %>%
+         ggplot(aes(x=rank, y=PC1)) +
+           geom_vline(aes(xintercept=round(0.01 * dim(treatment_pca$rotation)[1])),
+                      size=1.25,
+                      alpha=.5) +
+           geom_point(size=.5, alpha=.5) +
+           xlab("Site Rank") +
+           ylab("Weight") +
+           theme_bw() +
+           theme(axis.text = element_text(size=18),
+                 axis.title = element_text(size=20))
+
+filename <- "figures/3/selected_treatment_pc1_weights.pdf"
+ggsave(filename, plot = plt, width = 6, height = 1.5)
+filename <- "figures/3/selected_treatment_weights.svg"
+ggsave(filename, plot = plt, width = 6, height = 1.5)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, echo=FALSE}
+pc1_protein_group <- treatment_pca$rotation %>%
+                       as.data.frame() %>%
+                       select(PC1) %>%
+                       arrange(desc(abs(PC1))) %>%
+                       rownames_to_column("var") %>%
+                       mutate(protein = gsub("_.*", "", var),
+                              rank = 1:n(),
+                              selected = rank <= round(0.1 * n())) %>%
+                       distinct(protein, .keep_all="true")
+
+pc1_protein_group %>%
+  filter(selected) %>%
+  select(protein) %>%
+  write.csv("output/limma_coefficient_pc1_top_proteins.csv",
+            row.names=FALSE,
+            quote=FALSE)
+```
+
+```{r, echo=FALSE}
+sig_hits <- limma_results %>%
+              filter(regulated) %>%
+              select(site, treatment)
+
+overlap_count <- inner_join(sig_hits, sig_hits,
+                            by="site") %>%
+                   group_by(treatment.x, treatment.y) %>%
+                   count() %>%
+                   right_join(expand_grid(treatment.x = unique(sig_hits$treatment),
+                                          treatment.y = unique(sig_hits$treatment)),
+                              by=c("treatment.x", "treatment.y")) %>%
+                   replace(is.na(.), 0)
+
+filtered_overlap_count <- overlap_count %>%
+                            right_join(sites_per_treat %>%
+                                         filter(total >= 100) %>%
+                                         select(treatment.x = treatment),
+                                       by="treatment.x") %>%
+                            right_join(sites_per_treat %>%
+                                         filter(total >= 100) %>%
+                                         select(treatment.y = treatment),
+                                       by="treatment.y")
+```
+
+```{r, echo=FALSE}
+overlap_dist <- dist(filtered_overlap_count %>%
+                       pivot_wider(id_cols=treatment.x,
+                                   names_from=treatment.y,
+                                   values_from=n) %>%
+                       column_to_rownames("treatment.x"))
+overlap_order <- hclust(overlap_dist)
+```
+
+```{r, echo=FALSE}
+plt <- ggdendrogram(overlap_order, rotate = FALSE, size = 1) +
+         theme(axis.text = element_text(size=10))
+
+filename <- "figures/3/significant_coefficient_overlap_filtered_dendrogram.pdf"
+ggsave(filename, plot = plt, width = 14, height = 2)
+filename <- "figures/3/significant_coefficient_overlap_filtered_dendrogram.svg"
+ggsave(filename, plot = plt, width = 14, height = 2)
+knitr::include_graphics(filename)
+```
+
+```{r, echo=FALSE}
+plt <- filtered_overlap_count %>%
+         mutate(treatment.x = factor(treatment.x, 
+                                     levels=overlap_order$labels[overlap_order$order]),
+                treatment.y = factor(treatment.y, 
+                                     levels=overlap_order$labels[overlap_order$order])) %>%
+         ggplot(aes(x=treatment.x,
+                    y=treatment.y,
+                    fill=log10(n))) +
+         geom_tile() +
+           scale_fill_viridis_b("Log 10\n# Sig.\nCoefs",
+                                na.value = "#4a0b5a") +
+           theme(axis.text.x = element_text(angle = 90,
+                                            vjust = 0.5,
+                                            hjust=1),
+                 axis.title = element_blank())
+
+filename <- "figures/3/significant_coefficient_overlap_filtered.pdf"
+ggsave(filename, plot = plt, width = 14, height = 12)
+filename <- "figures/3/significant_coefficient_overlap_filtered.svg"
+ggsave(filename, plot = plt, width = 14, height = 12)
+knitr::include_graphics(filename)
+```
+
+The above plots give a great view into the overlap between conditions.
+In order to produce them,
+we just counted the number of overlapping significant coefficients between conditions.
+One thing that is apparent is that a large portion of treatments don't have much going on.
+There is a good chance that the discovered coefficients may be false positives,
+but further investigation is warranted to determine whether there are any robust but unique effects.
+The other large portion of treatments have high overlap between each other.
+There are at least two apparent clusters, with distinct patterns of connection between them.
+In the next section, I will try to use certain subsets of the data to tease apart effects.
+
+## 5. Investigation of treatment group similarities and differences
+
+```{r, echo=FALSE}
+custom_treat_groups <- data.frame(group = c("osmoStress", "osmoStress", "osmoStress", "osmoStress",
+                                            "highPh", "highPh", "highPh", "highPh",
+                                            "carbonStress2", "carbonStress2", "carbonStress2",
+                                            "carbonStress1", "carbonStress1", "carbonStress1",
+                                            "carbonStress1", "carbonStress1", "carbonStress1",
+                                            "carbonStress1", "carbonStress1", "carbonStress1"),
+                                  treatment = c("NC", "KC", "CA", "SO",
+                                                "C7", "C8", "I7", "I8",
+                                                "LG", "GL", "RF",
+                                                "EC", "OA", "CP", "CN", "CG", "NG", "KA", "PBS", "SA")) %>%
+                         mutate(group=str_replace(group, "Stress.", "Stress"))
+```
+
+```{r, echo=FALSE}
+sites_per_group <- limma_results %>%
+                     filter(regulated) %>%
+                     right_join(custom_treat_groups,
+                                by="treatment") %>%
+                     group_by(site, group) %>%
+                     count() %>%
+                     rename(nreg = n) %>%
+                     left_join(custom_treat_groups %>%
+                                 group_by(group) %>%
+                                 count() %>%
+                                 rename(ntotal = n),
+                               by="group")
+
+group_overlap_total <- sites_per_group %>%
+                         inner_join(sites_per_group,
+                                    by="site",
+                                    suffix=c("1", "2")) %>%
+                         group_by(group1, group2) %>%
+                         count()
+
+group_overlap_robust <- sites_per_group %>%
+                          filter(nreg == ntotal) %>%
+                          inner_join(sites_per_group %>%
+                                       filter(nreg == ntotal),
+                                     by="site",
+                                     suffix=c("1", "2")) %>%
+                          group_by(group1, group2) %>%
+                          count()
+
+group_robust_counts <- sites_per_group %>%
+                        filter(nreg == ntotal) %>%
+                        arrange(group, site) %>%
+                        mutate(protein = gsub("_.*", "", site)) %>%
+                        group_by(group) %>%
+                        summarise(nsites = length(unique(site)),
+                                  nproteins = length(unique(protein)),
+                                  .groups="drop")
+```
+
+```{r, echo=FALSE}
+plt <- group_robust_counts %>%
+         pivot_longer(c(2, 3), names_to="stat", values_to="count") %>%
+         mutate(group=factor(group, levels=c("osmoStress", "highPh", "carbonStress")),
+                stat=factor(stat, levels = c("nsites", "nproteins"))) %>%
+         ggplot(aes(x=group, y=count, fill=stat)) +
+           geom_bar(stat="identity",
+                    position="dodge",
+                    alpha=.75) +
+           geom_text(aes(x=as.integer(group) + .22*(-1)^as.integer(stat),
+                         y=count + 8,
+                         label=count),
+                     size=7) +
+           scale_fill_manual("Number of",
+                             values=c("#27898c", "#461554"),
+                             labels=c("Sites", "Proteins")) +
+           scale_x_discrete(labels=c("Osmotic\nstress",
+                                     "High PH\nstress",
+                                     "C-source\nstress")) +
+           xlab("Treatment Group") +
+           ylab("Count") + 
+           # ylim(0, 150) +
+           theme_bw() +
+           theme(axis.text.x = element_text(size=20, angle=45, vjust = 1, hjust=1),
+                 axis.text.y = element_text(size=20),
+                 axis.title = element_text(size=20),
+                 legend.text = element_text(size=20),
+                 legend.title = element_blank(),
+                 legend.position = "top")
+
+filename <- "figures/3/consistent_regulation_count.pdf"
+ggsave(filename, plot = plt, width = 4, height = 5.5)
+show(plt)
+```
+
+```{r, echo=FALSE}
+extract_selected_counts <- function(selected_treatments) {
+  selected_counts <- limma_results %>%
+                        filter(!(treatment %in% c("AF2", "HU2", "NO2", "SP", "LP", "YE"))) %>%
+                       filter(regulated) %>%
+                       mutate(group = if_else(treatment %in% selected_treatments, 
+                                              "selected", "other")) %>%
+                       group_by(group, site) %>%
+                       count() %>%
+                       ungroup() %>%
+                       pivot_wider(id_cols=site,
+                                   names_from=group,
+                                   values_from=n) %>%
+                       replace(is.na(.), 0) %>%
+                       filter(selected == length(selected_treatments))
+  
+  return(selected_counts)
+}
+```
+
+```{r, echo=FALSE}
+generate_scatter <- function(df, title) {
+  ggplot(df, aes(x=group, y=coef)) +
+    geom_jitter(width=.2) +
+    xlab("") +
+    ylab("Log2 Fold Change") +
+    ggtitle(title) +
+    theme_bw() +
+    theme(axis.text = element_text(size=18),
+          axis.title = element_text(size=20),
+          plot.title = element_text(size=20, hjust=.5))
+}
+```
+
+#### 5.1 Osmostressors
+
+```{r, echo=FALSE}
+selected_treatments <- custom_treat_groups %>% filter(group == "osmoStress") %>% .$treatment
+selected_counts <- extract_selected_counts(selected_treatments)
+
+plt <- selected_counts %>%
+         ggplot(aes(x=other + selected)) +
+         geom_histogram(bins=10) +
+         xlab("Number of significant coefficients") +
+         ylab("Count") +
+         ggtitle("Robust osmostress sites") +
+         theme_bw() +
+         theme(axis.text = element_text(size=24),
+               axis.title = element_text(size=24),
+               plot.title = element_text(size=24))
+
+filename <- "figures/3/robust_osmostress_coefficient_histogram.pdf"
+ggsave(filename, plot = plt, width = 6, height = 2.5)
+show(plt)
+```
+
+```{r, echo=FALSE}
+number <- 50
+plt1 <- selected_counts %>%
+          mutate(fixedSite = fix.names(site)) %>%
+          arrange(desc(other), desc(fixedSite)) %>%
+          mutate(fixedSite = factor(fixedSite, levels=fixedSite)) %>%
+          tail(number) %>%
+          left_join(limma_results %>%
+                      filter(treatment %in% selected_treatments),
+                    by="site") %>%
+          ggplot(aes(x=coef, y=fixedSite)) +
+            geom_jitter(size=2, height=.2, alpha=.4) +
+            geom_vline(aes(xintercept=0),
+                       linetype="dashed",
+                       size=1.5) +
+            xlab("Log2 fold change") +
+            ylab("") +
+            theme_bw() + 
+            theme(axis.text.x = element_text(size=16),
+                  axis.text.y = element_text(size=14),
+                  axis.title = element_text(size=16))
+
+plt2 <- selected_counts %>%
+          mutate(fixedSite = fix.names(site)) %>%
+          arrange(desc(other), desc(fixedSite)) %>%
+          mutate(fixedSite = factor(fixedSite, levels=fixedSite)) %>%
+          tail(number) %>%
+          ggplot(aes(x=other + selected, y=fixedSite)) +
+            geom_bar(stat="identity") +
+            scale_x_continuous(breaks=c(0, 10, 20), limits=c(0, 20)) +
+            xlab("Total") +
+            ylab("") +
+            theme_bw() + 
+            theme(axis.text.x = element_text(size=16),
+                  axis.text.y = element_blank(),
+                  axis.ticks.y = element_blank(),
+                  axis.title.x = element_text(size=16),
+                  axis.title.y = element_blank())
+
+plt <- plot_grid(plt1, plt2, rel_widths = c(3, 1))
+
+filename <- "figures/3/robust_osmostress_coefficient_count.pdf"
+ggsave(filename, plot = plt, width = 5, height = 10)
+filename <- "figures/3/robust_osmostress_coefficient_count.svg"
+ggsave(filename, plot = plt, width = 5, height = 10)
+knitr::include_graphics(filename)
+```
+
+```{r, echo=FALSE}
+plt <-
+  limma_results %>%
+    filter(treatment != "SP") %>%
+    filter(site == "YNR019W_S_175") %>%
+    mutate(group = if_else(treatment %in% selected_treatments, 
+                           "Osmotic\nStress",
+                           "Others"),
+           group = factor(group, levels=c("Others", "Osmotic\nStress"))) %>%
+    ggplot(aes(x=coef, y=group, color=adj.p.value < 0.01)) +
+      geom_jitter(size=4, width=.2, alpha=.4) +
+      xlab("LIMMA log2FC") +
+      ylab("") +
+      scale_color_manual(values=c("#461554", "#27898c")) +
+      scale_y_discrete(expand=rep(.25, 2)) +
+      ggtitle(fix.names("YNR019W_S_175")) +
+      theme_bw() +
+      theme(axis.text = element_text(size=20),
+            axis.title = element_text(size=20),
+            plot.title = element_text(size=20, hjust=.5),
+            plot.margin = unit(c(0, 0, 0, 0), "cm"),
+            legend.position = "none")
+
+filename <- "figures/3/robust_osmostress_hits_diss.pdf"
+ggsave(filename, plot = plt, width = 4, height = 2.25)
+show(plt)
+```
+
+```{r, echo=FALSE}
+generate_scatter <- function(df, title) {
+  ggplot(df, aes(x=group, y=coef, color=adj.p.value < 0.01)) +
+    geom_jitter(size=4, width=.2, alpha=.4) +
+    xlab("") +
+    ylab("LIMMA log2FC") +
+    scale_color_manual(values=c("#461554", "#27898c")) +
+    scale_x_discrete(expand=rep(.25, 2)) +
+    ggtitle(title) +
+    theme_bw() +
+    theme(axis.text = element_text(size=20),
+          axis.title = element_text(size=20),
+          plot.title = element_text(size=20, hjust=.5),
+          plot.margin = unit(c(0, 0, 0, 0), "cm"),
+          legend.position = "none")
+}
+
+sites_of_interest <- c("YNR019W_S_175", "YLR248W_S_515") #, "YML100W_T_75", "YMR261C_S_193")
+plt_list <- sites_of_interest %>%
+              map(function(s) {
+                limma_results %>%
+                  filter(treatment != "SP") %>%
+                  filter(site == s) %>%
+                  mutate(group = if_else(treatment %in% selected_treatments, 
+                         "Osmo.\nStress",
+                         "Others")) %>%
+                  generate_scatter(fix.names(s))
+              })
+plt_list[2:length(plt_list)] <- plt_list[2:length(plt_list)] %>% 
+                                  map(function(plt) plt + ylab(""))
+
+plt <- do.call(plot_grid, c(plt_list, ncol=length(plt_list)))
+
+filename <- "figures/3/robust_osmostress_hits.pdf"
+ggsave(filename, plot = plt, width = 6, height = 4)
+filename <- "figures/3/robust_osmostress_hits.svg"
+ggsave(filename, plot = plt, width = 6, height = 4)
+knitr::include_graphics(filename)
+```
+
+#### 5.2 PH Stress
+
+```{r, echo=FALSE}
+selected_treatments <-  custom_treat_groups %>% filter(group == "highPh") %>% .$treatment
+selected_counts <- extract_selected_counts(selected_treatments)
+
+plt <- selected_counts %>%
+         ggplot(aes(x=other)) +
+         geom_histogram(bins=10) +
+         xlab("Number of significant coefficients") +
+         ylab("Count") +
+         ggtitle("Robust high pH sites") +
+         theme_bw() +
+         theme(axis.text = element_text(size=24),
+               axis.title = element_text(size=24),
+               plot.title = element_text(size=24))
+
+filename <- "figures/3/robust_highph_coefficient_histogram.pdf"
+ggsave(filename, plot = plt, width = 6, height = 2.5)
+show(plt)
+```
+
+```{r, echo=FALSE}
+number <- 50
+plt1 <- selected_counts %>%
+          mutate(fixedSite = fix.names(site)) %>%
+          arrange(desc(other), desc(fixedSite)) %>%
+          mutate(fixedSite = factor(fixedSite, levels=fixedSite)) %>%
+          tail(number) %>%
+          left_join(limma_results %>%
+                      filter(treatment %in% selected_treatments),
+                    by="site") %>%
+          ggplot(aes(x=coef, y=fixedSite)) +
+            geom_jitter(size=2, height=.2, alpha=.4) +
+            geom_vline(aes(xintercept=0),
+                       linetype="dashed",
+                       size=1.5) +
+            xlab("Log2 fold change") +
+            ylab("") +
+            theme_bw() + 
+            theme(axis.text.x = element_text(size=16),
+                  axis.text.y = element_text(size=14),
+                  axis.title = element_text(size=16))
+
+plt2 <- selected_counts %>%
+          mutate(fixedSite = fix.names(site)) %>%
+          arrange(desc(other), desc(fixedSite)) %>%
+          mutate(fixedSite = factor(fixedSite, levels=fixedSite)) %>%
+          tail(number) %>%
+          ggplot(aes(x=other + selected, y=fixedSite)) +
+            geom_bar(stat="identity") +
+            scale_x_continuous(breaks=c(0, 10, 20, 30), limits=c(0, 30)) +
+            xlab("Total") +
+            ylab("") +
+            theme_bw() + 
+            theme(axis.text.x = element_text(size=16),
+                  axis.text.y = element_blank(),
+                  axis.ticks.y = element_blank(),
+                  axis.title.x = element_text(size=16),
+                  axis.title.y = element_blank())
+
+plt <- plot_grid(plt1, plt2, rel_widths = c(3, 1))
+
+filename <- "figures/3/robust_highph_coefficient_count.pdf"
+ggsave(filename, plot = plt, width = 5, height = 10)
+filename <- "figures/3/robust_highph_coefficient_count.svg"
+ggsave(filename, plot = plt, width = 5, height = 10)
+knitr::include_graphics(filename)
+```
+
+```{r, echo=FALSE}
+plt <-
+  limma_results %>%
+    filter(treatment != "SP") %>%
+    filter(site == "YER122C_S_398") %>%
+    mutate(group = if_else(treatment %in% selected_treatments, 
+                           "High PH",
+                           "Others"),
+           group = factor(group, levels=c("Others", "High PH"))) %>%
+    ggplot(aes(x=coef, y=group, color=adj.p.value < 0.01)) +
+      geom_jitter(size=4, height=.2, alpha=.4) +
+      xlab("LIMMA log2FC") +
+      ylab("") +
+      scale_color_manual(values=c("#461554", "#27898c")) +
+      scale_y_discrete(expand=rep(.25, 2)) +
+      ggtitle(fix.names("YER122C_S_398")) +
+      theme_bw() +
+      theme(axis.text = element_text(size=20),
+            axis.title = element_text(size=20),
+            plot.title = element_text(size=20, hjust=.5),
+            plot.margin = unit(c(0, 0, 0, 0), "cm"),
+            legend.position = "none")
+
+filename <- "figures/3/robust_highph_hits_diss.pdf"
+ggsave(filename, plot = plt, width = 4, height = 2.25)
+show(plt)
+```
+
+```{r, echo=FALSE}
+sites_of_interest <- c("YER122C_S_398", "YGL181W_S_184") # "YER122C_S_389", "YPL085W_S_762") # YPL085W might be a dud 
+plt_list <- sites_of_interest %>%
+              map(function(s) {
+                limma_results %>%
+                  filter(treatment != "SP") %>%
+                  filter(site == s) %>%
+                  mutate(group = if_else(treatment %in% selected_treatments, 
+                         "High\nPH",
+                         "Others")) %>%
+                  generate_scatter(fix.names(s))
+              })
+plt_list[2:length(plt_list)] <- plt_list[2:length(plt_list)] %>% 
+                                  map(function(plt) plt + ylab(""))
+ 
+plt <- do.call(plot_grid, c(plt_list, ncol=length(plt_list)))
+
+filename <- "figures/3/robust_ph_hits.pdf"
+ggsave(filename, plot = plt, width = 6, height = 4)
+filename <- "figures/3/robust_ph_hits.svg"
+ggsave(filename, plot = plt, width = 6, height = 4)
+knitr::include_graphics(filename)
+```
+
+## Carbon stress
+
+```{r, echo=FALSE}
+selected_treatments <-  custom_treat_groups %>% filter(str_detect(group, "carbonStress")) %>% .$treatment
+selected_counts <- extract_selected_counts(selected_treatments)
+
+plt <- selected_counts %>%
+         ggplot(aes(x=other)) +
+         geom_histogram(bins=10) +
+         xlab("Number of significant coefficients") +
+         ylab("Count") +
+         ggtitle("Robust c-source change sites") +
+         theme_bw() +
+         theme(axis.text = element_text(size=24),
+               axis.title = element_text(size=24),
+               plot.title = element_text(size=24)) 
+
+filename <- "figures/3/robust_carbonstress_coefficient_histogram.pdf"
+ggsave(filename, plot = plt, width = 6, height = 2.5)
+show(plt)
+```
+
+```{r, echo=FALSE}
+number <- 40
+plt1 <- selected_counts %>%
+          mutate(fixedSite = fix.names(site)) %>%
+          arrange(desc(other), desc(fixedSite)) %>%
+          mutate(fixedSite = factor(fixedSite, levels=fixedSite)) %>%
+          tail(number) %>%
+          left_join(limma_results %>%
+                      filter(treatment %in% selected_treatments),
+                    by="site") %>%
+          ggplot(aes(x=coef, y=fixedSite)) +
+            geom_jitter(size=2, height=.2, alpha=.4) +
+            geom_vline(aes(xintercept=0),
+                       linetype="dashed",
+                       size=1.5) +
+            xlab("Log2 fold change") +
+            ylab("") +
+            theme_bw() + 
+            theme(axis.text.x = element_text(size=16),
+                  axis.text.y = element_text(size=14),
+                  axis.title = element_text(size=16))
+
+plt2 <- selected_counts %>%
+          mutate(fixedSite = fix.names(site)) %>%
+          arrange(desc(other), desc(fixedSite)) %>%
+          mutate(fixedSite = factor(fixedSite, levels=fixedSite)) %>%
+          tail(number) %>%
+          ggplot(aes(x=other + selected, y=fixedSite)) +
+            geom_bar(stat="identity") +
+            xlab("Total") +
+            ylab("") +
+            theme_bw() + 
+            theme(axis.text.x = element_text(size=16),
+                  axis.text.y = element_blank(),
+                  axis.ticks.y = element_blank(),
+                  axis.title.x = element_text(size=16),
+                  axis.title.y = element_blank())
+
+plt <- plot_grid(plt1, plt2, rel_widths = c(3, 1))
+
+filename <- "figures/3/robust_carbonstress_coefficient_count.pdf"
+ggsave(filename, plot = plt, width = 5, height = 8)
+filename <- "figures/3/robust_carbonstress_coefficient_count.svg"
+ggsave(filename, plot = plt, width = 5, height = 8)
+knitr::include_graphics(filename)
+```
+
+```{r, echo=FALSE}
+plt <-
+  limma_results %>%
+    filter(treatment != "SP") %>%
+    filter(site == "YDR028C_S_346") %>%
+    mutate(group = if_else(treatment %in% selected_treatments, 
+                           "C-source\nchange",
+                           "Others"),
+           group = factor(group, levels=c("Others", "C-source\nchange"))) %>%
+    ggplot(aes(x=coef, y=group, color=adj.p.value < 0.01)) +
+      geom_jitter(size=4, height=.2, alpha=.4) +
+      xlab("LIMMA log2FC") +
+      ylab("") +
+      scale_color_manual(values=c("#461554", "#27898c")) +
+      scale_y_discrete(expand=rep(.25, 2)) +
+      ggtitle(fix.names("YDR028C_S_346")) +
+      theme_bw() +
+      theme(axis.text = element_text(size=20),
+            axis.title = element_text(size=20),
+            plot.title = element_text(size=20, hjust=.5),
+            plot.margin = unit(c(0, 0, 0, 0), "cm"),
+            legend.position = "none")
+
+filename <- "figures/3/robust_carbonstress_hits_diss.pdf"
+ggsave(filename, plot = plt, width = 4, height = 2.25)
+show(plt)
+```
+
+```{r, echo=FALSE}
+sites_of_interest <- c("YDR028C_S_346", "YPL058C_S_52") 
+plt_list <- sites_of_interest %>%
+              map(function(s) {
+                limma_results %>%
+                  filter(treatment != "SP") %>%
+                  filter(site == s) %>%
+                  mutate(group = if_else(treatment %in% selected_treatments, 
+                         "C-source\nchange",
+                         "Others")) %>%
+                  generate_scatter(fix.names(s))
+              })
+plt_list[2:length(plt_list)] <- plt_list[2:length(plt_list)] %>% 
+                                  map(function(plt) plt + ylab(""))
+ 
+plt <- do.call(plot_grid, c(plt_list, ncol=length(plt_list)))
+
+filename <- "figures/3/robust_carbonstress_hits.pdf"
+ggsave(filename, plot = plt, width = 6, height = 4)
+filename <- "figures/3/robust_carbonstress_hits.svg"
+ggsave(filename, plot = plt, width = 6, height = 4)
+knitr::include_graphics(filename)
+```
