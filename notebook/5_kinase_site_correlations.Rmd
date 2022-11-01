@@ -1,0 +1,1537 @@
+---
+title: "Analysis of Site Correlations"
+author: "Anthony Barente"
+date: "1/31/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggdendro)
+library(cowplot)
+library(WGCNA)
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+```
+
+## 1. Intro:
+
+Given the high diversity in perturbations in this study,
+the data are a good candidate to perform Weighted Gene Correlation Network Analysis.
+We will focus on specific downstream targets of kinases,
+which will give us course grained groupings of sites.
+This should help us recognize pathway crosstalk even for well established kinase targets.
+
+## 2. Data Used:
+
+Meta data for this report are available in:
+
+ - `yeast_phospho_data_processed/site_data_v2/meta_runs_samples.csv`
+ 
+Corrected and imputed data can be found in:
+
+ - `yeast_phospho_data_processed/site_data_v2/batch_correction/data_psites.vfilt.50.qrilc.rep1.corrected.csv`
+ 
+```{r, echo=FALSE}
+base_path <- "../yeast_phospho_data_processed/site_data_v2/"
+
+corrected_data <-
+  read.csv(file.path(base_path, "batch_correction/data_psites.vfilt.50.qrilc.rep1.corrected.csv"),
+           stringsAsFactors = FALSE)
+
+meta <- 
+  read.csv(file.path(base_path, "meta_runs_samples.csv"),
+           stringsAsFactors = FALSE)
+
+final_run_meta <- corrected_data %>%
+                    select(run, sample) %>%
+                    mutate(treatment = sub("\\..*", "", sample, perl=TRUE),
+                           treatment = factor(treatment, 
+                                              levels=union(c("UT"), sort(treatment)))) %>%
+                    distinct() %>%
+                    filter(treatment != "SP")
+```
+
+```{r, echo=FALSE}
+site_substrates <- read.csv("../auxiliary_data/kinase_phos_substrate_yeast_2.csv",
+                            stringsAsFactors = FALSE) %>%
+                     distinct(ref, kinase_activity, .keep_all=TRUE)
+
+site_modules <- read.csv("../umap_analysis/sites_umap_modules.csv")
+```
+
+```{r, echo=FALSE}
+fix.names <- function(sites) {
+  reference <- gsub("_.*", "", sites)
+  res_pos <- gsub("_", "", gsub("^.*?_", "", sites))
+  name <- read.csv("../phopsho_annotations/gene_annot.csv") %>%
+            column_to_rownames("reference") %>%
+            .[reference,1]
+  return(paste(str_to_title(name), res_pos))
+}
+```
+
+```{r, echo=FALSE}
+substrate_counts <- site_substrates %>%
+                      inner_join(corrected_data %>%
+                                   select(var) %>%
+                                   distinct(),
+                                 by = c("ref" = "var")) %>%
+                      group_by(kinase_activity) %>%
+                      count() %>%
+                      filter(n >= 10) %>%
+                      arrange(desc(n))
+
+ggplot() +
+  geom_bar(aes(x = factor(substrate_counts$kinase_activity,
+                          levels=as.factor(substrate_counts$kinase_activity)),
+               y = substrate_counts$n),
+           stat="identity") +
+  xlab("Kinase") +
+  ylab("Number of substrates") +
+  theme_bw() +
+  theme(axis.text.x = element_text(size=14, angle = 90, vjust = 0.5, hjust=1),
+        axis.text.y = element_text(size=14),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(size=18))
+```
+
+## 3. Site correlations in HOG1
+
+```{r, echo=FALSE}
+hog1_aux_sites <- read.csv("../auxiliary_data/hog1_sites.csv")
+hog1_aux_sites <- hog1_aux_sites %>%
+                    mutate(site = paste(protein, residue, pos, sep="_")) %>%
+                    arrange(site)
+hog1_data <- corrected_data %>%
+               inner_join(hog1_aux_sites %>% select(site),
+                          by=c("var" = "site"))
+```
+
+```{r, echo=FALSE}
+hog1_wide <- hog1_data %>%
+               inner_join(final_run_meta,
+                         by="run") %>%
+               group_by(var, treatment) %>%
+               summarise(value = mean(value),
+                         .groups = "drop") %>%
+               filter(!(treatment %in% c("AF2", "HU2", "NO2", "SP", "LP", "YE"))) %>%
+               pivot_wider(id_cols="treatment",
+                           names_from="var",
+                           values_from="value") %>%
+               column_to_rownames("treatment")
+```
+
+```{r, echo=FALSE}
+hog1_cor <- cor(hog1_wide)
+cor_order <- hclust(as.dist(1-hog1_cor))
+
+plt <- hog1_cor %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(2:dim(.)[2], names_to="var2") %>%
+  mutate(var1 = factor(var1, levels = cor_order$labels[cor_order$order]),
+         var2 = factor(var2, levels = cor_order$labels[cor_order$order])) %>%
+  ggplot(aes(x=var1, y=var2, fill=value)) +
+    geom_tile() +
+    scale_fill_distiller("Corr.", palette = "RdBu", direction = -1, limits=c(-1, 1)) + 
+    xlab("HOG1 targets") + 
+    ylab("HOG1 targets") +
+    theme_classic() + 
+    theme(axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title = element_text(size=24),
+          legend.text = element_text(size=18),
+          legend.title = element_text(size=20))
+
+filename <- "figures/5/hog1_site_cor.pdf"
+ggsave(filename, plot = plt, width = 7.25, height = 6)
+filename <- "figures/5/hog1_site_cor.svg"
+ggsave(filename, plot = plt, width = 7.25, height = 6)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, echo=FALSE}
+cor_order_copy <- cor_order
+cor_order_copy$labels <- fix.names(cor_order_copy$labels)
+plt <- ggdendrogram(cor_order_copy, rotate = FALSE, size = 1) +
+         theme(axis.text.x = element_text(size=30),
+               axis.text.y = element_blank())
+
+filename <- "figures/5/hog1_site_cor_dendrogram.pdf"
+ggsave(filename, plot = plt, width = 7.5, height = 3.5)
+filename <- "figures/5/hog1_site_cor_dendrogram.svg"
+ggsave(filename, plot = plt, width = 7.5, height = 3.5)
+knitr::include_graphics(filename)
+```
+
+```{r, include=FALSE}
+site_grouping <- data.frame(group = c(rep("group_2", 4), rep("group_1", 4)),
+                            site = cor_order$labels[cor_order$order][3:10],
+                            stringsAsFactors = FALSE)
+
+limma_results <- read_csv("output/limma_differential_expression_results.csv") %>%
+                   filter(!(treatment %in% c("AF2", "HU2", "NO2", "SP", "LP", "YE"))) %>%
+                   mutate(regulated = (adj.p.value < 0.05) & (abs(coef) >= 2))
+
+group_lfcs <- limma_results %>%
+                right_join(site_grouping,
+                           by="site")
+
+group_mean_lfcs <- group_lfcs %>%
+                     group_by(group, treatment) %>%
+                     summarise(coef = mean(coef)/sd(coef),
+                               .groups = "drop")
+```
+
+```{r, echo=FALSE}
+group_lfcs %>%
+  filter(treatment %in% c("NC", "KC", "CA", "SO")) %>%
+  filter(str_detect(site, "YOR018W", negate = TRUE)) %>%
+  mutate(group=as.factor(group), 
+         treatment = as.factor(treatment)) %>%
+  lm(coef~group + treatment, data=.) %>%
+  summary()
+```
+
+```{r, echo=FALSE}
+plt <- ggplot() +
+         geom_point(aes(x = 5*as.integer(group) + 
+                              as.integer(treatment) - 2.5 + 
+                              rnorm(length(treatment), sd=.1),
+                        y = coef, 
+                        color=regulated),
+                    data=group_lfcs %>%
+                           filter(treatment %in% c("NC", "KC", "CA", "SO")) %>%
+                           mutate(group=as.factor(group), 
+                                  treatment = as.factor(treatment)),
+                    alpha=.75,
+                    size=5) +
+         scale_color_manual("LIMMA Results",
+                            values=c("#461554", "#27898c"),
+                            labels=c("Not Regulated", "Regulated")) +
+         scale_x_continuous(breaks = c(3.5, 4.5, 5.5, 6.5, 8.5, 9.5, 10.5, 11.5)) +
+         annotate(geom = "text", 
+                  x = c(3.5, 4.5, 5.5, 6.5, 8.5, 9.5, 10.5, 11.5),
+                  y = -3.9, 
+                  label = c("CA", "KC", "NC", "SO", "CA", "KC", "NC", "SO"), 
+                  size = 8) +
+         annotate(geom = "text", 
+                  x = c(5, 10),
+                  y = -4.5, 
+                  label = c("Group 1", "Group 2"), 
+                  size = 8) +
+         coord_cartesian(xlim=c(3, 12), ylim = c(-3.5, 5.5), 
+                         expand = TRUE, clip = "off") +
+         xlab("") +
+         ylab("Log2 Fold Change") +
+         theme_bw() +
+         theme(axis.text.x = element_blank(),
+               axis.text.y = element_text(size=28),
+               axis.title = element_text(size=28),
+               legend.text = element_text(size=24),
+               legend.title = element_text(size=24),
+               legend.background = element_blank(),
+               legend.box.background = element_blank(),
+               legend.position = c(.7, .15))
+
+filename <- "figures/5/hog1_site_regrouped_lfc_osmostress.pdf"
+ggsave(filename, plot = plt, width = 6, height = 6)
+show(plt)
+```
+
+```{r, echo=FALSE}
+kanshin_data <- read.csv("../auxiliary_data/kanshin_hog1_site_kinetics.csv",
+                         stringsAsFactors = FALSE) %>%
+                  filter(primary_site != "YOR018W_S_602") %>%
+                  group_by(primary_site) %>%
+                  mutate(lfc = lfc/median(tail(lfc, 3))) %>%
+                  filter(lfc < 1.25) %>%
+                  ungroup()
+
+# Resampled difference
+set.seed(98115)
+n_trials <- 1000
+differences <- rep(0, n_trials)
+for (trial in 1:n_trials) {
+  group_shuffle <- sample(kanshin_data$group, dim(kanshin_data)[1], replace=FALSE)
+
+  group_1_model <- lm("lfc ~ poly(time, 3)",
+                      kanshin_data %>%
+                        filter(group_shuffle == "group_1"))
+  group_2_model <- lm("lfc ~ poly(time, 3)",
+                      kanshin_data %>% 
+                        filter(group_shuffle == "group_2"))
+
+  time_diff <- kanshin_data$time[1:13][predict(group_2_model)[1:13] > .5][1] -
+                 kanshin_data$time[1:13][predict(group_1_model)[1:13] > .5][1]
+  differences[trial] <- time_diff
+}
+
+# Actual difference
+group_1_model <- lm("lfc ~ poly(time, 3)", kanshin_data %>% filter(group == "group_1"))
+group_2_model <- lm("lfc ~ poly(time, 3)", kanshin_data %>% filter(group == "group_2"))
+
+time_diff <- kanshin_data$time[1:13][predict(group_2_model)[1:13] > .5][1] -
+               kanshin_data$time[1:13][predict(group_1_model)[1:13] > .5][1]
+
+plt <-
+ggplot() +
+  geom_line(aes(x=kanshin_data$time[1:13],
+                y=predict(group_1_model)[1:13]),
+            color="#461554",
+            size=1.5) +
+  geom_line(aes(x=kanshin_data$time[1:13],
+                y=predict(group_2_model)[1:13]),
+            color="#23958a",
+            size=1.5) +
+  geom_point(data = kanshin_data,
+             aes(x=time, y=lfc,
+                 color=group,
+                 shape=fix.names(primary_site)),
+             alpha=.75,
+             size=3) +
+  scale_color_manual(values=c("#461554", "#23958a"), labels=c("Group 1", "Group 2")) +
+  scale_y_continuous(breaks=c(0.0, 0.25, 0.5, 0.75, 1.0)) +
+  xlab("Time (seconds)") +
+  ylab("Scaled Intensity") +
+  labs(color="Group", shape="Phosphosite") +
+  theme_bw() +
+  theme(axis.text = element_text(size=22),
+        axis.title = element_text(size=24),
+        legend.text = element_text(size=22),
+        legend.title = element_text(size=22))
+
+filename <- "figures/5/hog1_site_kanshin_time_course.pdf"
+ggsave(filename, plot = plt, width = 7, height = 4)
+show(plt)
+```
+
+```{r, echo=FALSE}
+limma_results %>%
+  filter(str_detect(site, "YLR113W")) %>%
+  filter(treatment %in% c("NC", "KC", "CA", "SO"))
+```
+
+```{r, echo=FALSE}
+treatment_groups <-
+  read.csv("../yeast_phospho_data/ml036_dia_quant_perturbation_v2/meta_conditions.csv",
+         stringsAsFactors = FALSE) %>%
+  select(treatment = cond, type)
+
+ wide_lfcs <- group_mean_lfcs %>%
+                pivot_wider(id_cols="treatment",
+                            names_from="group",
+                            values_from="coef") %>%
+                mutate(error = abs(group_1 - group_2)) %>%
+                left_join(treatment_groups,
+                          by="treatment")
+
+plt <- ggplot() +
+         geom_point(data = wide_lfcs %>% filter(group_1 > -2 & group_2 < 2),
+                    aes(x=group_1, y=group_2, color=type)) +
+         geom_point(data = wide_lfcs %>% filter(group_1 < -2 | group_2 > 2),
+                    aes(x=group_1, y=group_2, color=type),
+                    size=3) +
+         geom_text(data = wide_lfcs %>% filter(group_1 < -2 | group_2 > 2),
+                   #filter(error >= quantile(error, .9)),
+                   aes(x=group_1, y=group_2, label=treatment),
+                   size=6) +
+         geom_abline(aes(intercept=0, slope=1)) +
+         xlab("Group 1 relative activity") +
+         ylab("Group 2 relative activity") +
+         scale_color_manual("Perurbation\ntype",
+                    values=c("#8fab19", "#f5212e", "#de9efd", "#19ffcc",
+                             "#305999", "#e1e1e1", "#198254", "#f8a19e",
+                             "#85630c", "#fd00fa", "#545454", "#fae323",
+                             "#3082fd", "#14ff30", "#a80cfd")) +
+         theme_bw() +
+         theme() +
+         theme(axis.text = element_text(size=18),
+               axis.title = element_text(size=20),
+               legend.position = "none")
+
+filename <- "figures/5/hog1_site_regrouped_lfc_difference.pdf"
+ggsave(filename, plot = plt, width = 4.25, height = 4)
+show(plt)
+```
+
+```{r, echo=FALSE}
+hog1_pca <- prcomp(t(hog1_wide), scale.=TRUE)
+perc_var <- 100*(hog1_pca$sdev^2)/sum(hog1_pca$sdev^2)
+plt <- ggplot() +
+         geom_point(aes(x=hog1_pca$x[,1],
+                        y=hog1_pca$x[,2])) +
+         geom_text(aes(x=hog1_pca$x[,1] +
+                         c(-3, 0., 0., 3, 0., 0., 0., -3, -3, 3),
+                       y=hog1_pca$x[,2] +
+                         c(0., -.3, .3, 0., .3, .3, .3, 0, 0., 0.),
+                       label = fix.names(colnames(hog1_wide)))) +
+         xlab(paste("PC1 (", round(perc_var[1], 1), "%)", sep="")) +
+         ylab(paste("PC2 (", round(perc_var[2], 1), "%)", sep="")) +
+         xlim(-10, 20) +
+         ylim(-5, 5) +
+         theme_bw() +
+         theme(axis.text = element_text(size=14),
+               axis.title = element_text(size=16),
+               legend.text = element_text(size=14),
+               legend.title = element_text(size=14))
+
+filename <- "figures/5/hog1_pca.pdf"
+ggsave(filename, plot = plt, width = 6.5, height = 6)
+filename <- "figures/5/hog1_pca.svg"
+ggsave(filename, plot = plt, width = 6.5, height = 6)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, echo=FALSE}
+pc2_all <- hog1_pca$rotation %>%
+             as.data.frame() %>%
+             rownames_to_column("treatment") %>%
+             select(treatment, PC2) %>%
+             arrange(desc(abs(PC2))) %>%
+             ggplot(aes(x=1:dim(.)[1], y=abs(PC2))) +
+               geom_bar(stat="identity") +
+               xlab("Treatment index") + 
+               ylab("Absolute\nPC2 Weight") +
+               scale_x_continuous(expand = c(.02, .02)) +
+               theme_bw() +
+               theme(axis.text = element_text(size=14),
+                     axis.title = element_text(size=14))
+
+pc2_red <- hog1_pca$rotation %>%
+             as.data.frame() %>%
+             rownames_to_column("treatment") %>%
+             select(treatment, PC2) %>%
+             arrange(desc(abs(PC2))) %>%
+             mutate(treatment = factor(treatment, levels=treatment)) %>%
+             head(15) %>%
+             ggplot(aes(x=treatment, y=abs(PC2))) +
+               geom_bar(stat="identity") +
+               xlab("Treatment") + 
+               ylab("Absolute\nPC2 Weight") + 
+               theme_bw() +
+               theme(axis.text = element_text(size=14),
+                     axis.title = element_text(size=14))
+
+
+plt <- plot_grid(pc2_all, pc2_red, nrow=2)
+
+filename <- "figures/5/hog1_pca_pc2_weights.pdf"
+ggsave(filename, plot = plt, width = 9, height = 3)
+filename <- "figures/5/hog1_pc2_weights.svg"
+ggsave(filename, plot = plt, width = 9, height = 3)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, echo=FALSE}
+hold_out_group <- c("YOL051W_T_750", "YGR097W_T_808", "YOR018W_S_602")
+treatments_of_interest <- c("RF", "CN", "PBS", "NG", "EC", "CP", "KA", "CG")
+limma_results <- read.csv("output/limma_differential_expression_results.csv")
+
+plt_list <- treatments_of_interest %>%
+              map(function(cur_treat) {
+                limma_results %>%
+                  inner_join(hog1_aux_sites %>% select(site),
+                             by="site") %>%
+                  filter(treatment == cur_treat) %>%
+                  mutate(group = if_else(site %in% hold_out_group, "Group 2", "Group 1")) %>%
+                  ggplot(aes(x=group, y=coef)) +
+                    geom_point(alpha=.75, size=3) +
+                    xlab("") +
+                    ylab("Log2 Fold Change") +
+                    ggtitle(cur_treat) +
+                    theme_bw() +
+                    theme(axis.text.x = element_text(size=14, 
+                                                     angle = 90, vjust = 0.5, hjust=1),
+                          axis.text.y = element_text(size=14),
+                          axis.title = element_text(size=14),
+                          plot.title = element_text(hjust = 0.5),
+                          plot.margin = unit(c(0, 0, 0, 0), "cm"))
+              })
+plt_list[2:length(plt_list)] <- plt_list[2:length(plt_list)] %>% 
+                                  map(function(plt) plt + ylab(""))
+
+plt <- do.call(plot_grid, c(plt_list, ncol=length(plt_list)))
+
+filename <- "figures/5/hog1_pca_pc2_interesting_treatments.pdf"
+ggsave(filename, plot = plt, width = 12, height = 3)
+filename <- "figures/3/hog1_pca_pc2_interesting_treatments.svg"
+ggsave(filename, plot = plt, width = 12, height = 3)
+knitr::include_graphics(filename)
+```
+
+## 5. WGCNA analysis of TORC1
+
+```{r, echo=FALSE}
+selected_sites <- site_substrates %>%
+                    filter(kinase_activity == "TORC1") %>%
+                    select(site=ref)
+
+selected_exp <- corrected_data %>%
+                  inner_join(selected_sites,
+                             by = c("var"="site")) %>%
+                  inner_join(final_run_meta,
+                             by="run") %>%
+                  group_by(treatment, var) %>%
+                  summarise(value = mean(value),
+                            .groups="drop") %>%
+                  filter(!(treatment %in% c("AF2", "HU2", "NO2", "SP", "LP", "YE"))) %>%
+                  pivot_wider(id_cols="treatment",
+                              names_from="var",
+                              values_from="value") %>%
+                  column_to_rownames("treatment")
+```
+
+```{r, echo=FALSE}
+powers = 1:10
+sft = pickSoftThreshold(selected_exp, powerVector = powers)
+```
+
+```{r, echo=FALSE}
+plt1 <- sft$fitIndices %>%
+          ggplot(aes(x=Power, y=-sign(slope)*SFT.R.sq)) +
+            geom_point() +
+            geom_hline(aes(yintercept=.8)) +
+            theme_bw() +
+            xlab("Soft Threshold (power)") +
+            ylab("Scale Free Topology Model Fit, signed R^2") +
+            scale_x_continuous(breaks=1:10) +
+            scale_y_continuous(breaks=seq(-.25, 1, .25),
+                               limits=c(-.25, 1))
+
+plt2 <- sft$fitIndices %>%
+          ggplot(aes(x=Power, y=mean.k.)) +
+            geom_point() +
+            theme_bw() +
+            xlab("Soft Threshold (power)") +
+            ylab("Mean Connectivity") +
+            scale_x_continuous(breaks=1:10)
+
+plt <- plot_grid(plt1, plt2, ncol=2)
+plt         
+```
+
+```{r, include=FALSE}
+softPower = 8
+adjacency = adjacency(selected_exp, power = softPower)
+TOM = TOMsimilarity(adjacency)
+colnames(TOM) <- colnames(adjacency)
+rownames(TOM) <- rownames(adjacency)
+dissTOM = 1-TOM
+```
+
+```{r, echo=FALSE}
+# Call the hierarchical clustering function
+geneTree = hclust(as.dist(dissTOM), method = "average")
+
+# We like large modules, so we set the minimum module size relatively high:
+minModuleSize = 32
+
+# Module identification using dynamic tree cut:
+dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                            deepSplit = 2, pamRespectsDendro = FALSE,
+                            minClusterSize = minModuleSize)
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+```
+
+```{r, echo=FALSE}
+site_cor <- cor(selected_exp)
+cor_order <- hclust(as.dist(1-site_cor))
+
+plt <- site_cor %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(2:dim(.)[2], names_to="var2") %>%
+  mutate(var1 = factor(var1, levels = cor_order$labels[cor_order$order]),
+         var2 = factor(var2, levels = cor_order$labels[cor_order$order])) %>%
+  ggplot(aes(x=var1, y=var2, fill=value)) +
+    geom_tile() + 
+    scale_fill_distiller(palette = "RdBu", direction = -1, limits=c(-1, 1)) + 
+    xlab("TORC1 targets") + 
+    ylab("TORC1 targets") +
+    theme_classic() + 
+    theme(axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title = element_text(size=20))
+
+filename <- "figures/5/torc1_site_cor.png"
+ggsave(filename, plot = plt, width = 7, height = 6)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, echo=FALSE}
+plt <- ggplot() +
+           geom_bar(aes(x=1:length(dynamicMods),
+                    y=rep(1, length(dynamicMods)),
+                    fill=as.factor(dynamicMods[cor_order$order])),
+                    stat="identity",
+                    width = 1,
+                    alpha=.75) +
+           xlim(-5, length(dynamicMods) + 1) +
+           ylab("Dynamic\nTree Cut") +
+           scale_fill_viridis_d() +
+           theme_nothing() + 
+           theme(axis.text = element_blank(),
+                 axis.title.y = element_text(vjust = -7),
+                 legend.position = "none")
+
+filename <- "figures/5/torc1_site_cor_clusters.png"
+ggsave(filename, plot = plt, width = 10, height = 1)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, echo=FALSE}
+site_cor <- cor(selected_exp)
+
+plt <- site_cor %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(2:dim(.)[2], names_to="var2") %>%
+  mutate(var1 = factor(var1, levels = cor_order$labels[geneTree$order]),
+         var2 = factor(var2, levels = cor_order$labels[geneTree$order])) %>%
+  ggplot(aes(x=var1, y=var2, fill=value)) +
+    geom_tile() +
+    #geom_vline(aes(xintercept = "YHR205W_T_723")) + 
+    #geom_vline(aes(xintercept = "YPR185W_S_348"), color="blue") +
+    scale_fill_distiller(palette = "RdBu", direction = -1, limits=c(-1, 1)) + 
+    xlab("TORC1 targets") + 
+    ylab("TORC1 targets") +
+    theme_classic() + 
+    theme(axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title = element_text(size=20))
+
+filename <- "figures/5/torc1_site_cor_reorder.png"
+ggsave(filename, plot = plt, width = 7.25, height = 6)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, include=FALSE}
+cor_order$labels[geneTree$order][grepl("YPR185W", cor_order$labels[geneTree$order])]
+```
+
+```{r, echo=FALSE}
+plt <- ggplot() +
+           geom_bar(aes(x=1:length(dynamicMods),
+                    y=rep(1, length(dynamicMods)),
+                    fill=as.factor(dynamicMods[geneTree$order])),
+                    stat="identity",
+                    width = 1,
+                    alpha=.75) +
+           xlim(-5, length(dynamicMods) + 1) +
+           ylab("Dynamic\nTree Cut") +
+           scale_fill_viridis_d() +
+           theme_nothing() + 
+           theme(axis.text = element_blank(),
+                 axis.title.y = element_text(vjust = -7),
+                 legend.position = "none")
+
+filename <- "figures/5/torc1_site_cor_reorder_clusters.png"
+ggsave(filename, plot = plt, width = 10, height = 1)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, echo=FALSE}
+site_groups <- data.frame(var=colnames(selected_exp), group=dynamicMods)
+inner_join(site_modules,
+           site_groups,
+           by=c("ref"="var")) %>%
+  group_by(group, module) %>%
+  count() %>%
+  pivot_wider(id_cols="module", names_from="group", values_from="n") %>%
+  replace(is.na(.), 0) %>%
+  pivot_longer(2:dim(.)[2], names_to="group", values_to="n") %>%
+  ggplot(aes(x=module, y=group)) +
+    geom_tile(aes(fill=n)) +
+    geom_text(aes(label = n)) +
+    scale_fill_gradient(low="white", high="blue") +
+    xlab("Module from UMAP analysis") +
+    ylab("Cluster from WGCNA") +
+    theme_bw()
+```
+
+```{r, echo=FALSE}
+# Plot the dendrogram and colors underneath
+sizeGrWindow(8,6)
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05,
+                    main = "Gene dendrogram and module colors")
+```
+
+```{r, include=FALSE}
+MEDissThres = 0.3
+# Call an automatic merging function
+merge = mergeCloseModules(selected_exp, dynamicColors, cutHeight = MEDissThres, verbose = 3)
+# The merged module colors
+mergedColors = merge$colors;
+# Eigengenes of the new merged modules:
+mergedMEs = merge$newMEs;
+```
+
+```{r, include=FALSE}
+# Calculate eigengenes
+MEList = moduleEigengenes(selected_exp, colors = dynamicColors)
+MEs = MEList$eigengenes
+# Calculate dissimilarity of module eigengenes
+MEDiss = 1-cor(MEs);
+# Cluster module eigengenes
+METree = hclust(as.dist(MEDiss), method = "average");
+# Plot the result
+sizeGrWindow(7, 6)
+plot(METree, main = "Clustering of module eigengenes",
+xlab = "", sub = "")
+MEDissThres = 0.3
+# Plot the cut line into the dendrogram
+abline(h=MEDissThres, col = "red")
+# Call an automatic merging function
+merge = mergeCloseModules(selected_exp, dynamicColors, cutHeight = MEDissThres, verbose = 3)
+# The merged module colors
+mergedColors = merge$colors;
+# Eigengenes of the new merged modules:
+mergedMEs = merge$newMEs;
+```
+
+```{r, echo=FALSE}
+sizeGrWindow(12, 9)
+plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors),
+                    c("Dynamic Tree Cut", "Merged dynamic"),
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+```
+
+```{r, echo=FALSE}
+plt <- ggplot() +
+           geom_bar(aes(x=1:length(dynamicMods),
+                    y=rep(1, length(dynamicMods)),
+                    fill=as.factor(dynamicMods[geneTree$order])),
+                    stat="identity",
+                    width = 1,
+                    alpha=.75) +
+           xlim(-5, length(dynamicMods) + 1) +
+           ylab("Dynamic\nTree Cut") +
+           scale_fill_viridis_d() +
+           theme_nothing() + 
+           theme(axis.text = element_blank(),
+                 axis.title.y = element_text(vjust = -7),
+                 legend.position = "none")
+
+filename <- "figures/5/torc1_site_cor_reorder_clusters.png"
+ggsave(filename, plot = plt, width = 10, height = 1)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, include=FALSE}
+sizeGrWindow(12, 9)
+#pdf(file = "Plots/geneDendro-3.pdf", wi = 9, he = 6)
+plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors),
+c("Dynamic Tree Cut", "Merged dynamic"),
+dendroLabels = FALSE, hang = 0.03,
+addGuide = TRUE, guideHang = 0.05)
+#dev.off()
+```
+
+```{r, include=FALSE}
+# Rename to moduleColors
+moduleColors = mergedColors
+# Construct numerical labels corresponding to the colors
+colorOrder = c("grey", standardColors(50))
+moduleLabels = match(moduleColors, colorOrder)-1
+MEs = mergedMEs
+```
+
+## 6. WGCNA analysis of the full TORC1 cascade
+
+```{r, echo=FALSE}
+kinases <- c("TORC1", "SCH9", "SLT2", "YAK1", "RIM15", "TAP42", "NPR1", "GCN2", "ATG1")
+selected_sites <- site_substrates %>%
+                    filter(kinase_activity %in% kinases) %>%
+                    select(site=ref)
+
+selected_exp <- corrected_data %>%
+                  inner_join(selected_sites,
+                             by = c("var"="site")) %>%
+                  inner_join(final_run_meta,
+                             by="run") %>%
+                  group_by(treatment, var) %>%
+                  summarise(value = mean(value),
+                            .groups="drop") %>%
+                  filter(!(treatment %in% c("AF2", "HU2", "NO2", "SP", "LP", "YE"))) %>%
+                  pivot_wider(id_cols="treatment",
+                              names_from="var",
+                              values_from="value") %>%
+                  column_to_rownames("treatment")
+```
+
+```{r, echo=FALSE}
+plt <- selected_sites %>%
+         inner_join(corrected_data %>% distinct(var),
+                    by=c("site"="var")) %>%
+         inner_join(site_substrates %>%
+                      filter(marker=="kinase activity") %>%
+                      select(site=ref, kinase=kinase_activity),
+                    by="site") %>%
+         group_by(kinase) %>%
+         count() %>%
+         ungroup() %>%
+         arrange(desc(n)) %>%
+         filter(n >= 10) %>%
+         mutate(kinase = factor(kinase, levels=kinase)) %>%
+         ggplot(aes(x=kinase, y=n)) +
+           geom_bar(stat="identity") +
+           xlab("Kinase") +
+           ylab("Number of targets") +
+           theme_bw() +
+           theme(axis.text.x = element_text(size=16, angle=90, hjust=1, vjust=.5),
+                 axis.text.y = element_text(size=16),
+                 axis.title = element_text(size=18))
+
+filename <- "figures/5/torc1_cascade_all_kinases.pdf"
+ggsave(filename, plot = plt, width = 5, height = 3)
+show(plt)
+```
+
+
+```{r, echo=FALSE}
+powers = 1:10
+sft = pickSoftThreshold(selected_exp, powerVector = powers)
+```
+
+```{r, echo=FALSE}
+plt1 <- sft$fitIndices %>%
+          ggplot(aes(x=Power, y=-sign(slope)*SFT.R.sq)) +
+            geom_point() +
+            geom_hline(aes(yintercept=.8),
+                       linetype="dashed",
+                       size=1.5,
+                       alpha=.8) +
+            xlab("Soft threshold") +
+            ylab("Scale free topology fit") +
+            scale_x_continuous(breaks=1:10) +
+            scale_y_continuous(breaks=round(seq(-.6, 1, .2), 1),
+                               limits=c(-.6, 1)) +
+            theme_bw() +
+            theme(axis.text = element_text(size=20),
+                  axis.title = element_text(size=20))
+
+plt2 <- sft$fitIndices %>%
+          ggplot(aes(x=Power, y=mean.k.)) +
+            geom_point() +
+            xlab("Soft threshold") +
+            ylab("Mean Connectivity") +
+            scale_x_continuous(breaks=1:10)+
+            theme_bw() +
+            theme(axis.text = element_text(size=20),
+                  axis.title = element_text(size=20))
+
+plt <- plot_grid(plt1, plt2, ncol=2)
+
+filename <- "figures/5/torc1_cascade_scale_free_model_fit.pdf"
+ggsave(filename, plot = plt, width = 7, height = 4)
+plt         
+```
+
+```{r, include=FALSE}
+softPower = 7
+adjacency = adjacency(selected_exp, power = softPower)
+TOM = TOMsimilarity(adjacency)
+colnames(TOM) <- colnames(adjacency)
+rownames(TOM) <- rownames(adjacency)
+dissTOM = 1-TOM
+```
+
+```{r, echo=FALSE}
+# Call the hierarchical clustering function
+geneTree = hclust(as.dist(dissTOM), method = "average")
+
+# We like large modules, so we set the minimum module size relatively high:
+minModuleSize = 16
+
+# Module identification using dynamic tree cut:
+dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                            deepSplit = 2, pamRespectsDendro = FALSE,
+                            minClusterSize = minModuleSize)
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+```
+
+```{r, echo=FALSE}
+site_cor <- cor(selected_exp)
+cor_order <- hclust(as.dist(1-site_cor))
+
+plt <- site_cor %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(2:dim(.)[2], names_to="var2") %>%
+  mutate(var1 = factor(var1, levels = cor_order$labels[cor_order$order]),
+         var2 = factor(var2, levels = cor_order$labels[cor_order$order])) %>%
+  ggplot(aes(x=var1, y=var2, fill=value)) +
+    geom_tile() + 
+    scale_fill_distiller(palette = "RdBu", direction = -1, limits=c(-1, 1)) + 
+    xlab("Sites in the TORC1 cascade") + 
+    ylab("Sites in the TORC1 cascade") +
+    theme_classic() + 
+    theme(axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title = element_text(size=20))
+
+filename <- "figures/5/torc1_cascade_site_cor.png"
+ggsave(filename, plot = plt, width = 7, height = 6)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, echo=FALSE}
+site_cor <- cor(selected_exp)
+
+plt <- site_cor %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(2:dim(.)[2], names_to="var2") %>%
+  mutate(var1 = factor(var1, levels = cor_order$labels[geneTree$order]),
+         var2 = factor(var2, levels = cor_order$labels[geneTree$order])) %>%
+  ggplot(aes(x=var1, y=var2, fill=value)) +
+    geom_tile() +
+    scale_fill_distiller("Corr.", palette = "RdBu", direction = -1, limits=c(-1, 1)) + 
+    xlab("Sites in the TORC1 cascade") + 
+    ylab("Sites in the TORC1 cascade") +
+    theme_classic() + 
+    theme(axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title = element_text(size=20))
+
+filename <- "figures/5/torc1_cascade_site_cor_reorder.png"
+ggsave(filename, plot = plt, width = 7, height = 6)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, echo=FALSE}
+site_groups <- data.frame(var=colnames(selected_exp), group=dynamicMods)
+inner_join(site_modules,
+           site_groups,
+           by=c("ref"="var")) %>%
+  group_by(group, module) %>%
+  count() %>%
+  pivot_wider(id_cols="module", names_from="group", values_from="n") %>%
+  replace(is.na(.), 0) %>%
+  pivot_longer(2:dim(.)[2], names_to="group", values_to="n") %>%
+  ggplot(aes(x=module, y=group)) +
+    geom_tile(aes(fill=n)) +
+    geom_text(aes(label = n)) +
+    scale_fill_gradient(low="white", high="blue") +
+    xlab("Module from UMAP analysis") +
+    ylab("Cluster from WGCNA") +
+    theme_bw()
+```
+
+```{r, include=FALSE}
+# Calculate eigengenes
+MEList = moduleEigengenes(selected_exp, colors = dynamicColors)
+MEs = MEList$eigengenes
+# Calculate dissimilarity of module eigengenes
+MEDiss = 1-cor(MEs);
+# Cluster module eigengenes
+METree = hclust(as.dist(MEDiss), method = "average");
+# Plot the result
+sizeGrWindow(7, 6)
+plot(METree, main = "Clustering of module eigengenes",
+xlab = "", sub = "")
+MEDissThres = 0.3
+# Plot the cut line into the dendrogram
+abline(h=MEDissThres, col = "red")
+# Call an automatic merging function
+merge = mergeCloseModules(selected_exp, dynamicColors, cutHeight = MEDissThres, verbose = 3)
+# The merged module colors
+mergedColors = merge$colors;
+# Eigengenes of the new merged modules:
+mergedMEs = merge$newMEs;
+```
+
+```{r, echo=FALSE}
+sizeGrWindow(12, 9)
+plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors),
+                    c("Dynamic Tree Cut", "Merged dynamic"),
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+```
+
+```{r, include=FALSE}
+# Rename to moduleColors
+moduleColors = mergedColors
+# Construct numerical labels corresponding to the colors
+colorOrder = c("grey", standardColors(50))
+moduleLabels = match(moduleColors, colorOrder)-1
+MEs = mergedMEs
+```
+
+```{r, echo=FALSE}
+# Redo modules so they end up in order 
+site_wgcna_modules <- data.frame(var=colnames(selected_exp),
+                                 originalIndex=1:dim(selected_exp)[2],
+                                 tomOrder=order(geneTree$order),
+                                 originalModule=moduleLabels)
+
+site_wgcna_modules_remap <- site_wgcna_modules %>%
+                              group_by(originalModule) %>%
+                              summarise(midpoint=median(tomOrder),
+                                        .groups="drop") %>%
+                              arrange(midpoint) %>%
+                              mutate(newModule = as.integer(factor(originalModule, 
+                                                                   levels=unique(originalModule))) - 1L) %>%
+                              select(-midpoint)
+
+site_wgcna_modules <- site_wgcna_modules %>%
+                        left_join(site_wgcna_modules_remap,
+                                  by="originalModule") %>%
+                        arrange(newModule, tomOrder) %>%
+                        mutate(newOrder=1:n())
+```
+
+```{r, echo=FALSE}
+site_wgcna_modules %>%
+  select(site = var, module = newModule) %>%
+  write.csv(file="output/torc1_cascade_wgcna_modules.csv",
+            row.names = FALSE,
+            quote=FALSE)
+```
+
+```{r, echo=FALSE}
+plt <- site_wgcna_modules %>%
+         group_by(newModule) %>%
+         count() %>%
+         ggplot(aes(x=as.factor(newModule), y=n)) +
+           geom_bar(stat="identity") + 
+           geom_text(aes(y=n+20, label=n),
+                     size=6) +
+           xlab("Module") +
+           ylab("Number of sites") +
+           scale_x_discrete(labels = c("Not\nassigned", 1:7)) +
+           theme_bw() +
+           theme(axis.text = element_text(size=16),
+                 axis.title = element_text(size=18))
+
+filename <- "figures/5/torc1_cascade_module_counts.pdf"
+ggsave(filename, plot = plt, width = 5, height = 3)
+plt
+```
+
+```{r, echo=FALSE}
+plt <- ggplot() +
+           geom_bar(aes(x=newOrder,
+                        y=rep(1, dim(site_wgcna_modules)[1]), 
+                        fill=as.factor(newModule)),
+                    data=site_wgcna_modules,
+                    stat="identity",
+                    width = 1,
+                    alpha=.8) +
+           geom_text(aes(x=midpoint, y=.5, label=newModule),
+                     data=site_wgcna_modules %>%
+                            group_by(newModule) %>%
+                            summarise(midpoint=median(newOrder)) %>%
+                            filter(newModule > 0),
+                     size=10) +
+           ylab("Dynamic\nTree Cut") +
+           scale_fill_manual(values = cbPalette) +
+           theme_nothing() + 
+           theme(axis.text = element_blank(),
+                 axis.title.y = element_text(vjust = -7),
+                 legend.position = "none")
+
+filename <- "figures/5/torc1_cascade_site_cor_reorder_clusters.pdf"
+ggsave(filename, plot = plt, width = 10, height = .5)
+filename <- "figures/5/torc1_cascade_site_cor_reorder_clusters.png"
+ggsave(filename, plot = plt, width = 10, height = .5, dpi = 600)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, echo=FALSE}
+site_cor <- cor(selected_exp)
+
+plt <- site_cor %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(2:dim(.)[2], names_to="var2") %>%
+  mutate(var1 = factor(var1, levels = cor_order$labels[site_wgcna_modules$originalIndex]),
+         var2 = factor(var2, levels = cor_order$labels[site_wgcna_modules$originalIndex])) %>%
+  # mutate(value = ifelse(var1==var2, NA, value)) %>%
+  ggplot(aes(x=var1, y=var2, fill=value)) +
+    geom_tile() +
+    scale_fill_distiller("Corr.", palette = "RdBu", direction = -1, limits=c(-1, 1)) + 
+    xlab("Sites in the TORC1 cascade") + 
+    ylab("Sites in the TORC1 cascade") +
+    theme_classic() + 
+    theme(axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title = element_text(size=20))
+
+filename <- "figures/5/torc1_cascade_site_cor_final.pdf"
+ggsave(filename, plot = plt, width = 7, height = 6)
+filename <- "figures/5/torc1_cascade_site_cor_final.png"
+ggsave(filename, plot = plt, width = 7, height = 6, dpi=600)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, echo=FALSE}
+module_exp <- MEs %>%
+                rownames_to_column("treatment") %>%
+                pivot_longer(2:dim(.)[2], names_to="originalModuleColors") %>%
+                mutate(originalModuleColors=str_replace(originalModuleColors, "ME", ""),
+                       originalModule=match(originalModuleColors, colorOrder)-1) %>%
+                left_join(site_wgcna_modules_remap,
+                          by="originalModule") %>%
+                arrange(newModule) %>%
+                filter(newModule > 0)
+
+module_cor <- module_exp %>%
+                pivot_wider(id_cols="treatment",
+                            names_from = "newModule",
+                            values_from = "value") %>%
+                column_to_rownames("treatment") %>%
+                as.matrix() %>%
+                cor()
+
+module_cor_order <- hclust(as.dist(1-module_cor))
+```
+
+```{r, echo=FALSE}
+plt <- 
+ggdendrogram(module_cor_order) +
+  xlab("Module") +
+  ylab("") +
+  scale_y_continuous(limits=c(0, 1.5), expand=c(0, 0)) +
+  theme_classic() +
+  theme(axis.text = element_text(size=24),
+        axis.title = element_text(size=24),
+        axis.ticks.x = element_blank(),
+        axis.line.x = element_blank())
+
+filename <- "figures/5/torc1_cascade_module_similarity.pdf"
+ggsave(filename, plot = plt, width = 7, height = 4)
+plt
+```
+
+```{r, echo=FALSE}
+de_treatment_cluster <- read.csv("output/treatment_clusters.csv")
+
+relative_module_exp <- module_exp %>%
+                         mutate(treatment = factor(treatment,
+                                                   levels=union(c("UT"), sort(treatment)))) %>%
+                         group_by(newModule) %>%
+                         summarise(treatment = treatment[-1],
+                                   value = value[-1] - value[1],
+                                   .groups="drop") %>%
+                         right_join(de_treatment_cluster %>%
+                                      select(treatment),
+                                    by="treatment") %>%
+                         pivot_wider(id_cols="treatment", names_from="newModule") %>%
+                         column_to_rownames("treatment") %>%
+                         as.matrix()
+```
+
+```{r, echo=FALSE}
+# row_order <- hclust(dist(relative_module_exp))
+col_order <- hclust(dist(t(relative_module_exp)))
+
+plt <- relative_module_exp %>%
+  as.data.frame() %>%
+  rownames_to_column("treatment") %>%
+  pivot_longer(2:dim(.)[2], names_to="module") %>%
+  mutate(treatment = factor(treatment, levels=de_treatment_cluster %>% arrange(order) %>% .$treatment)) %>%
+         #module = factor(module, levels = col_order$labels[col_order$order])) %>%
+  ggplot(aes(x=module, y=treatment, fill=value)) + 
+    geom_tile() +
+    scale_fill_distiller("Module\nactivation", palette = "RdBu", direction = -1, limits=c(-.5, .5)) +
+    xlab("WGCNA Module") +
+    ylab("") +
+    theme_bw() +
+    theme(axis.text.x = element_text(size=18),
+          axis.text.y = element_text(size=14),
+          axis.title = element_text(size=18),
+          legend.text = element_text(size=16),
+          legend.title = element_text(size=16))
+
+filename <- "figures/5/torc1_cascade_site_eigensite_expression.pdf"
+ggsave(filename, plot = plt, width = 5, height = 10)
+filename <- "figures/5/torc1_cascade_site_eigensite_expression.svg"
+ggsave(filename, plot = plt, width = 5, height = 10)
+knitr::include_graphics(filename)
+```
+
+```{r, echo=FALSE}
+plt <- 
+module_exp %>%
+  mutate(treatment = factor(treatment,
+                            levels=union(c("UT"), sort(treatment)))) %>%
+  group_by(newModule) %>%
+  summarise(treatment = treatment[-1],
+            value = value[-1] - value[1],
+            .groups="drop") %>%
+  as.data.frame() %>%
+  left_join(treatment_groups,
+            by="treatment") %>%
+  mutate(type = if_else(type %in% c("pH", "C/N source", "osmostressor"),
+                        type, "Other"),
+         type = str_to_title(type),
+         type = if_else(type == "Ph", "pH", type),
+         type = factor(type, levels=c("Other", "C/N Source", "Osmostressor", "pH"))) %>%
+  ggplot(aes(x=value, y=type, fill=type)) +
+    geom_vline(aes(xintercept=0)) + 
+    geom_boxplot(width=.6, alpha=.5, outlier.shape = NA) +
+    geom_jitter(size=1, height=.2, alpha=.75) +
+    facet_grid(rows = vars(newModule)) +
+    xlab("Relative activity") +
+    ylab("") +
+    scale_x_continuous(breaks=c(-0.3, 0.0, 0.3)) +
+    theme_bw() +
+    theme(axis.text.x = element_text(size=20),
+          axis.text.y = element_text(size=20),
+          axis.title = element_text(size=20),
+          strip.text.y = element_text(size = 20),
+          legend.position = "none")
+
+filename <- "figures/5/torc1_cascade_site_eigensite_expression_boxplot.pdf"
+ggsave(filename, plot = plt, width = 5, height = 10)
+filename <- "figures/5/torc1_cascade_site_eigensite_expression_boxplot.svg"
+ggsave(filename, plot = plt, width = 5, height = 10)
+knitr::include_graphics(filename)
+```
+
+```{r, echo=FALSE}
+plt <- 
+module_exp %>%
+  mutate(treatment = factor(treatment,
+                            levels=union(c("UT"), sort(treatment)))) %>%
+  group_by(newModule) %>%
+  summarise(treatment = treatment[-1],
+            value = value[-1] - value[1],
+            .groups="drop") %>%
+  as.data.frame() %>%
+  left_join(treatment_groups,
+            by="treatment") %>%
+  ggplot(aes(x=as.factor(newModule), y=value, color=type)) +
+    geom_jitter(size=2, width=.2) +
+    ylab("Module") +
+    xlab("Relative module activity") +
+    scale_color_manual("Perurbation\ntype",
+                       values=c("#8fab19", "#f5212e", "#de9efd", "#19ffcc",
+                                "#305999", "#e1e1e1", "#198254", "#f8a19e",
+                                "#85630c", "#fd00fa", "#545454", "#fae323",
+                                "#3082fd", "#14ff30", "#a80cfd")) +
+    theme_bw() +
+    theme(axis.text.x = element_text(size=18),
+          axis.text.y = element_text(size=14),
+          axis.title = element_text(size=18),
+          legend.text = element_text(size=16),
+          legend.title = element_text(size=16))
+
+filename <- "figures/5/torc1_cascade_site_eigensite_expression_presentation.pdf"
+ggsave(filename, plot = plt, width = 10, height = 5)
+filename <- "figures/5/torc1_cascade_site_eigensite_expression_presentation.svg"
+ggsave(filename, plot = plt, width = 10, height = 5)
+knitr::include_graphics(filename)
+```
+
+```{r, echo=FALSE}
+plt <- ggdendrogram(col_order, rotate = FALSE) +
+         theme(axis.text.x = element_text(size=32),
+               axis.text.y = element_blank())
+
+filename <- "figures/5/torc1_cascade_site_eigensite_cor.pdf"
+ggsave(filename, plot = plt, width = 4, height = 2)
+filename <- "figures/5/torc1_cascade_site_eigensite_cor.svg"
+ggsave(filename, plot = plt, width = 4, height = 2)
+knitr::include_graphics(filename)
+```
+
+```{r, echo=FALSE}
+site_motifs <- read.csv("../phopsho_annotations/motif_class.csv",
+                        stringsAsFactors = FALSE) %>%
+                 mutate(ref=gsub("(_[A-Z])([0-9])", "\\1_\\2", ref))
+
+motif_module_counts <- site_motifs %>%
+                         inner_join(site_wgcna_modules,
+                                    by=c("ref" = "var")) %>%
+                         rename(module=newModule) %>%
+                         group_by(class, module) %>%
+                         count() %>%
+                         pivot_wider(id_cols="module", names_from="class", values_from="n") %>%
+                         replace(is.na(.), 0) %>%
+                         pivot_longer(2:dim(.)[2], names_to="class", values_to="n") %>%
+                         filter(module != 0) %>%
+                         group_by(module) %>%
+                         mutate(prop = n/sum(n))
+
+motif_counts <- site_motifs %>%
+                  inner_join(site_wgcna_modules,
+                             by=c("ref" = "var")) %>%
+                  group_by(class) %>%
+                  count() %>%
+                  ungroup() %>%
+                  mutate(prop = n/sum(n))
+
+plt <- motif_module_counts %>%
+         left_join(motif_counts,
+                   by="class") %>%
+         mutate(enrichment = prop.x/prop.y,
+                class = factor(class, levels=c("acidic", "basic", "Pro.directed", "others"))) %>%
+         ggplot(aes(x=as.factor(module), y=class)) +
+           geom_tile(aes(fill=enrichment),
+                     alpha=.5) +
+           geom_text(aes(label=round(enrichment, 2)),
+                     size=6) +
+           xlab("WGCNA Module") +
+           ylab("") +
+           scale_fill_gradient2("Enrichment", low="red", mid="white", high="blue",
+                                limits=c(0., 2.5), midpoint = 1) +
+           scale_y_discrete(labels=c("Acidic", "Basic",
+                                     "Proline\nDirected",
+                                     "Other")) +
+           theme_bw() +
+           theme(axis.text = element_text(size=20),
+                 axis.title = element_text(size=20),
+                 legend.text = element_text(size=18),
+                 legend.title = element_text(size=18))
+
+filename <- "figures/5/torc1_cascade_cluster_enrichments.pdf"
+ggsave(filename, plot = plt, width = 7, height = 4)
+show(plt)
+```
+
+```{r, echo=FALSE}
+plt <- 
+site_substrates %>%
+  filter(kinase_activity %in% kinases) %>%
+  right_join(site_wgcna_modules,
+             by=c("ref" = "var")) %>%
+  rename(module=newModule) %>%
+  group_by(kinase_activity, module) %>%
+  count() %>%
+  filter(module > 0) %>%
+  pivot_wider(id_cols="module", names_from="kinase_activity", values_from="n") %>%
+  # replace(is.na(.), 0) %>%
+  pivot_longer(2:dim(.)[2], names_to="kinase_activity", values_to="n") %>%
+  mutate(module=factor(module),
+         kinase_activity=factor(kinase_activity, levels=rev(kinase_activity))) %>%
+  ggplot(aes(x=as.factor(module), y=kinase_activity)) +
+    geom_tile(fill="white", color="black") +
+    geom_text(aes(label = n),
+              size=7) +
+    scale_fill_gradient(low="white", high="blue") +
+    xlab("WGCNA Module") +
+    ylab("") +
+    theme_classic() +
+    theme(axis.text = element_text(size=20),
+          axis.title = element_text(size=20),
+          axis.line = element_blank())
+
+filename <- "figures/5/torc1_cascade_target_assignments.pdf"
+ggsave(filename, plot = plt, width = 7, height = 7)
+show(plt)        
+```
+
+```{r, echo=FALSE}
+inner_join(site_modules,
+           site_wgcna_modules,
+           by=c("ref"="var")) %>%
+  group_by(module, newModule) %>%
+  count() %>%
+  pivot_wider(id_cols="module", names_from="newModule", values_from="n") %>%
+  replace(is.na(.), 0) %>%
+  pivot_longer(2:dim(.)[2], names_to="newModule", values_to="n") %>%
+  ggplot(aes(x=module, y=newModule)) +
+    geom_tile(aes(fill=n)) +
+    geom_text(aes(label = n)) +
+    scale_fill_gradient(low="white", high="blue") +
+    xlab("Module from UMAP analysis") +
+    ylab("Cluster from WGCNA") +
+    theme_bw()
+```
+
+```{r, echo=FALSE}
+site_motifs <- read.csv("../phopsho_annotations/motif_class.csv",
+                        stringsAsFactors = FALSE) %>%
+                 mutate(ref=gsub("(_[A-Z])([0-9])", "\\1_\\2", ref))
+
+motif_module_counts <- site_motifs %>%
+                         inner_join(site_wgcna_modules,
+                                    by=c("ref" = "var")) %>%
+                         rename(module=newModule) %>%
+                         group_by(class, module) %>%
+                         count() %>%
+                         pivot_wider(id_cols="module", names_from="class", values_from="n") %>%
+                         replace(is.na(.), 0) %>%
+                         pivot_longer(2:dim(.)[2], names_to="class", values_to="n") %>%
+                         filter(module != 0) %>%
+                         group_by(class) %>%
+                         mutate(prop = n/sum(n))
+
+module_counts <- site_wgcna_modules %>%
+                   rename(module=newModule) %>%
+                   group_by(module) %>%
+                   count() %>%
+                   ungroup() %>%
+                   filter(module != 0) %>%
+                   mutate(prop = n/sum(n))
+
+motif_module_counts %>%
+  left_join(module_counts,
+            by="module") %>%
+  mutate(enrichment = prop.x/prop.y) %>%
+  ggplot(aes(x=class, y=as.factor(module))) +
+    geom_tile(aes(fill=enrichment)) +
+    geom_text(aes(label=round(enrichment, 2))) +
+    xlab("Motif class") +
+    ylab("WGCNA Module") +
+    scale_fill_gradient(low="white", high="blue") + 
+    theme_bw()
+```
+  
+## 6. WGCNA analysis of PPZ1 targets
+
+```{r, echo=FALSE}
+selected_sites <- read.csv("../phopsho_annotations/phosphatase_sites.csv") %>%
+                    mutate(ref = str_replace(ref, "_([STY])", "_\\1_")) %>%
+                    filter(phosphatase == "PPZ1") %>%
+                    select(site=ref)
+
+selected_exp <- corrected_data %>%
+                  inner_join(selected_sites,
+                             by = c("var"="site")) %>%
+                  inner_join(final_run_meta,
+                             by="run") %>%
+                  group_by(treatment, var) %>%
+                  summarise(value = mean(value),
+                            .groups="drop") %>%
+                  filter(!(treatment %in% c("AF2", "HU2", "NO2", "SP", "LP", "YE"))) %>%
+                  pivot_wider(id_cols="treatment",
+                              names_from="var",
+                              values_from="value") %>%
+                  column_to_rownames("treatment")
+```
+
+```{r, include=FALSE}
+read.csv("output/torc1_cascade_wgcna_modules.csv",
+         stringsAsFactors = FALSE) %>%
+  filter(site %in% colnames(selected_exp))
+```
+
+```{r, echo=FALSE}
+site_cor <- cor(selected_exp)
+cor_order <- hclust(as.dist(1-site_cor))
+
+plt <- site_cor %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(2:dim(.)[2], names_to="var2") %>%
+  mutate(var1 = factor(var1, levels = cor_order$labels[cor_order$order]),
+         var2 = factor(var2, levels = cor_order$labels[cor_order$order])) %>%
+  ggplot(aes(x=var1, y=var2, fill=value)) +
+    geom_tile() + 
+    scale_fill_distiller(palette = "RdBu", direction = -1, limits=c(-1, 1)) + 
+    xlab("PPZ1 Target Sites") + 
+    ylab("PPZ1 Target Sites") +
+    theme_classic() + 
+    theme(axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title = element_text(size=20))
+
+filename <- "figures/5/ppz1_site_cor.png"
+ggsave(filename, plot = plt, width = 7, height = 6)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, echo=FALSE}
+powers = 1:10
+sft = pickSoftThreshold(selected_exp, powerVector = powers)
+```
+
+```{r, echo=FALSE}
+plt1 <- sft$fitIndices %>%
+          ggplot(aes(x=Power, y=-sign(slope)*SFT.R.sq)) +
+            geom_point() +
+            geom_hline(aes(yintercept=.8),
+                       linetype="dashed",
+                       size=1.5,
+                       alpha=.8) +
+            xlab("Soft threshold") +
+            ylab("Scale free topology fit") +
+            scale_x_continuous(breaks=1:10) +
+            scale_y_continuous(breaks=round(seq(-.6, 1, .2), 1),
+                               limits=c(-.6, 1)) +
+            theme_bw() +
+            theme(axis.text = element_text(size=20),
+                  axis.title = element_text(size=20))
+
+plt2 <- sft$fitIndices %>%
+          ggplot(aes(x=Power, y=mean.k.)) +
+            geom_point() +
+            xlab("Soft threshold") +
+            ylab("Mean Connectivity") +
+            scale_x_continuous(breaks=1:10)+
+            theme_bw() +
+            theme(axis.text = element_text(size=20),
+                  axis.title = element_text(size=20))
+
+plt <- plot_grid(plt1, plt2, ncol=2)
+
+filename <- "figures/5/ppz1_site_scale_free_model_fit.pdf"
+ggsave(filename, plot = plt, width = 7, height = 4)
+plt         
+```
+
+```{r, include=FALSE}
+softPower = 7
+adjacency = adjacency(selected_exp, power = softPower)
+TOM = TOMsimilarity(adjacency)
+colnames(TOM) <- colnames(adjacency)
+rownames(TOM) <- rownames(adjacency)
+dissTOM = 1-TOM
+```
+
+```{r, echo=FALSE}
+# Call the hierarchical clustering function
+geneTree = hclust(as.dist(dissTOM), method = "average")
+
+# We like large modules, so we set the minimum module size relatively high:
+minModuleSize = 16
+
+# Module identification using dynamic tree cut:
+dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                            deepSplit = 2, pamRespectsDendro = FALSE,
+                            minClusterSize = minModuleSize)
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+```
+
+```{r, echo=FALSE}
+site_cor <- cor(selected_exp)
+
+plt <- site_cor %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(2:dim(.)[2], names_to="var2") %>%
+  mutate(var1 = factor(var1, levels = cor_order$labels[geneTree$order]),
+         var2 = factor(var2, levels = cor_order$labels[geneTree$order])) %>%
+  ggplot(aes(x=var1, y=var2, fill=value)) +
+    geom_tile() +
+    scale_fill_distiller("Corr.", palette = "RdBu", direction = -1, limits=c(-1, 1)) + 
+    xlab("PPZ1 Target Sites") + 
+    ylab("PPZ1 Target Sites") +
+    theme_classic() + 
+    theme(axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title = element_text(size=20))
+
+filename <- "figures/5/torc1_cascade_site_cor_reorder.png"
+ggsave(filename, plot = plt, width = 7, height = 6)
+knitr::include_graphics(filename, dpi=10)
+```
+
+```{r, include=FALSE}
+data.frame(site=cor_order$labels[geneTree$order]) %>%
+  left_join(read.csv("output/torc1_cascade_wgcna_modules.csv",
+                     stringsAsFactors = FALSE),
+            by="site")
+
+```
